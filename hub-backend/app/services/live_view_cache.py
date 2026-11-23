@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from weakref import WeakValueDictionary
 from collections.abc import Awaitable, Callable
 from typing import Any
+from weakref import WeakValueDictionary
 
 
 class _Generation:
