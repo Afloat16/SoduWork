@@ -13,8 +13,19 @@ async function create({ app, owner, result, guard }) {
   const target = path.join(folder, path.basename(result.filename));
   assertNoLinks(anchor, target); await fs.mkdir(folder, { recursive: true }); assertNoLinks(anchor, target);
   await guard();
-  try { await fs.writeFile(target, result.bytes, { flag: 'wx', mode: 0o600 }); }
+  let output;
+  try { output = await fs.open(target, 'wx', 0o600); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
+  if (output) {
+    try {
+      await fs.writeFile(output, result.bytes);
+      await output.close();
+    } catch (error) {
+      await output.close().catch(() => {});
+      await fs.unlink(target).catch(() => {});
+      throw error;
+    }
+  }
   assertNoLinks(anchor, target);
   const stat = await fs.stat(target);
   const mismatch = () => Object.assign(Error('本地压缩包与交付版本不一致，请重新生成成果后再试'), {code:'DELIVERY_ARCHIVE_INVALID'});
