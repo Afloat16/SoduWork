@@ -8,7 +8,7 @@ const { createHash } = require('node:crypto');
 const { create } = require('../main/conversation/cloud-result-local');
 
 async function fixture(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'sodu-local-result-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cloud-local-result-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const directory = path.join(root, 'cloud'), data = path.join(root, 'app'), owner = 'fixture-owner';
   await fs.mkdir(directory); await fs.mkdir(data);
