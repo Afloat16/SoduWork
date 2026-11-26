@@ -915,10 +915,9 @@ async def batch_dispatch(
     import asyncio as _aio
 
     from ..models import Milestone
-    from ..services import ai_exec
+    from ..services import ai_exec, task_assignment, task_requirements
     from ..services import batch_dispatch as batches
     from ..services import task_events as ev
-    from ..services import task_assignment, task_requirements
 
     requested_ids = body.get("taskIds") or []
     if not isinstance(requested_ids, list):

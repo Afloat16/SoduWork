@@ -193,11 +193,12 @@ async def _dispatch_flow(session: AsyncSession, g: dict, client, repo) -> dict:
     Preserve one source-task milestone per bug; task_status propagates completed batch state to
     members.
     """
+    from fastapi import HTTPException
+
     from .. import automation_models as am
     from ..realtime import hub
-    from . import task_events as ev
-    from fastapi import HTTPException
     from . import batch_dispatch, workflow_engine
+    from . import task_events as ev
 
     binding = await session.get(am.PluginBinding, g["flowBindingId"])
     if binding is None or not binding.enabled:

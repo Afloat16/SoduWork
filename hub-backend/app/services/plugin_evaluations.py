@@ -12,11 +12,18 @@ from sqlalchemy import BigInteger, cast, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import automation_models as am, models
+from .. import automation_models as am
+from .. import models
 from ..db import SessionLocal
-from . import (agent_route_selection, ai_exec, ai_remote, artifact_bytes, environment_service,
-               plugin_runtime, workflow_inputs)
-
+from . import (
+    agent_route_selection,
+    ai_exec,
+    ai_remote,
+    artifact_bytes,
+    environment_service,
+    plugin_runtime,
+    workflow_inputs,
+)
 
 ACTIVE_STATES = {"queued", "running"}
 FINAL_STATES = {"completed", "failed", "cancelled"}

@@ -30,9 +30,9 @@ from ..services import (
     resource_access,
     storage,
     task_access,
+    task_attachment_uploads,
     task_requirements,
 )
-from ..services import task_attachment_uploads
 
 router = APIRouter(prefix="/api/v1", tags=["attachments"])
 

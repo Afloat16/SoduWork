@@ -949,8 +949,8 @@ def _task_file_entry(row, digest):
 
 
 def _read_task_file(row):
-    from contextlib import closing
     import hashlib
+    from contextlib import closing
 
     from . import storage
 

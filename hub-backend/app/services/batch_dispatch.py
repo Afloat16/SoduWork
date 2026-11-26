@@ -6,7 +6,14 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from ..models import Milestone, Task, TaskEvent
-from . import ai_exec, dispatch_attempts, execution_sessions, task_access, task_events, task_status
+from . import (
+    ai_exec,
+    dispatch_attempts,
+    execution_sessions,
+    task_access,
+    task_events,
+    task_status,
+)
 from .requirement_edit_policy import STARTED_EVENT
 
 

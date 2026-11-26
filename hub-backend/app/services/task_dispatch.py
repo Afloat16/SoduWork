@@ -42,10 +42,16 @@ async def _active_workflow(session, tid):
 async def dispatch(tid, body, client, session, *, actor=None, handoff_claim=None):
     import asyncio as _aio
 
-    from ..services import ai_exec, dispatch_attempts, dispatch_identity
+    from ..services import (
+        ai_exec,
+        client_access,
+        conversation_handoffs,
+        dispatch_attempts,
+        dispatch_identity,
+        managed_work_route,
+    )
     from ..services import task_events as ev
     from ..services.conversation_turns import ensure_available, execution_instruction
-    from ..services import client_access, conversation_handoffs, managed_work_route
     confirmed_inputs = "inputManifest" in body
     confirmed_files = confirmed_sources = confirmation_error = None
     if confirmed_inputs:
