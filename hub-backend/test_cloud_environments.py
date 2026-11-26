@@ -259,7 +259,8 @@ class CloudEnvironmentsTests(HandoffFixture, unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("capacity test did not release the Runner reply")
             return {"ok": True, "data": {"ref": data["dispatchId"], "state": "running"}}
 
-        async def dispatch(task_id, body, client, session):
+        async def dispatch(task_id, body, client, session, *, handoff_claim):
+            self.assertTrue(handoff_claim)
             task = SimpleNamespace(id=task_id)
             result = await asyncio.to_thread(ai_remote.dispatch_sync,
                 {"allowedOrgs": [], "allowedClients": [], "allowedRunners": [node.id],
