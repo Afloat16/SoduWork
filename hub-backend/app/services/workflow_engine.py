@@ -21,6 +21,7 @@ from . import (agent_route_selection, ai_exec, ai_prompts, deployments, environm
                task_assignment, task_code_targets, workflow_context, workflow_contracts,
                workflow_control, resource_leases,
                workflow_inputs)
+from .workflow_contracts import stored_rework_policy
 from .workflow_runs import (
     RETRYABLE_GATE_TYPES, _bind_single_project_repo, _event, _ms, _now, execution_preferences,
     execution_route, list_runs, node_api, redispatch_running_gate, retry_failed_gate,
@@ -459,7 +460,8 @@ def _when_matches(node: dict, latest: dict[str, am.NodeRun]) -> bool:
     if not when:
         return True
     source = latest.get(str(when.get("node") or ""))
-    return source is not None and (source.output or {}).get("value") == when.get("equals")
+    return (source is not None and source.state == "succeeded" and "value" in (source.output or {})
+            and source.output["value"] == when.get("equals"))
 
 
 async def _schedule(session: AsyncSession, run: am.WorkflowRun) -> None:
@@ -510,7 +512,7 @@ async def _schedule_locked(session: AsyncSession, run_id: str) -> None:
                 # An explicitly authorized rework receives its own one-time allowance independent of earlier infrastructure retries.
                 if current.state != "rework" or int(rework_budget.get(key) or 0) <= 0:
                     continue
-            deps = [latest.get(x) for x in (node.get("dependsOn") or [])]
+            deps = [latest.get(x) for x in workflow_contracts.direct_dependencies(node)]
             if any(x is None or x.state not in _DONE for x in deps):
                 continue
             attempt = (current.attempt + 1) if current else 1
@@ -556,11 +558,19 @@ async def _schedule_locked(session: AsyncSession, run_id: str) -> None:
                                            and int(rework_budget.get(n["key"]) or 0) > 0))]
     notify_failed: dict | None = None
     notify_failed_task = None
+    failure_reason = ""
+    if not failed and not run.current_nodes:
+        # Installed versions may predate validation of implicit condition edges.
+        # Surface an unsatisfiable graph instead of polling the run indefinitely.
+        try:
+            workflow_contracts.validate_dependency_graph(nodes)
+        except ValueError as error:
+            failed = [node for node in nodes if node["key"] not in latest]
+            failure_reason = str(error)
     if failed:
         failed_node = failed[0]
-        failed_row = latest[failed_node["key"]]
         run.state, run.error, run.finished_at = (
-            "failed", failed_row.error or "自动返修次数已用完", _now())
+            "failed", failure_reason or latest[failed_node["key"]].error or "自动返修次数已用完", _now())
         _event(session, run.id, "run.failed", detail={"error": run.error})
         # Persist workflow failures on the task timeline as well as internal engine history.
         # Push the changed state to clients.
@@ -678,6 +688,14 @@ async def _execute_ai(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun
         bind_cfg, project_defaults, nr.node_key)
     route = execution_route(run.context or {}, bind_cfg, cfg, nr.node_key)
     kind = route["agentKind"]
+    from . import agent_execution_options, model_catalog
+    gateway_model = route.get("modelSource") == "catalog" and kind in agent_execution_options.GATEWAY_MODEL_KINDS
+    if gateway_model:
+        llm = await model_catalog.resolve(session, None, route["model"])
+        if not llm:
+            raise workflow_contracts.WorkflowConfigurationError(
+                f"模型「{route['model']}」当前不可用，请重新选择可用模型")
+        ctx = ai_exec.with_llm(ctx, llm)
     # Prefer the previous executor for rework to retain workspace, credentials, and toolchain continuity.
     # Honor an explicit executor change instead of pinning back to the old machine.
     sticky = None if route.get("manual") else await _same_runner_as_ai(session, run)
@@ -688,7 +706,7 @@ async def _execute_ai(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun
     selection = await asyncio.to_thread(
         agent_route_selection.resolve_sync, ctx, kind, task.owner_client_id or "",
         sticky.id if sticky is not None else "", required, runner_tags,
-        route.get("fallbackMode") or "best-effort", route.get("model") or "")
+        route.get("fallbackMode") or "best-effort", route.get("model") or "", gateway_model=gateway_model)
     picked = selection.get("agent")
     fallback_kind = str(selection.get("fallbackKind") or "")
     relaxed_tags = [str(x) for x in (selection.get("relaxedTags") or [])]
@@ -744,9 +762,9 @@ async def _execute_ai(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun
         "networkAllowed": selected_capabilities["network"],
         "requiredAgentCapabilities": selected_capabilities["runtime"],
     })
-    from . import agent_execution_options
     extra["agentExecution"] = agent_execution_options.runtime_options(
-        kind, route.get("model") or "", route.get("reasoningEffort") or "")
+        selection["resolvedKind"] if gateway_model else kind,
+        route.get("model") or "", route.get("reasoningEffort") or "")
 
     extra['bindingId'] = run.binding_id
     if runtime_secrets:
@@ -1097,7 +1115,7 @@ def _descendants(nodes: list[dict], root: str) -> set[str]:
     while changed:
         changed = False
         for node in nodes:
-            if node["key"] not in affected and affected.intersection(node.get("dependsOn") or []):
+            if node["key"] not in affected and affected.intersection(workflow_contracts.direct_dependencies(node)):
                 affected.add(node["key"])
                 changed = True
     return affected
@@ -1380,13 +1398,15 @@ async def _execute_node(session: AsyncSession, outbox: am.WorkflowOutbox) -> Non
             if str(status.get("failureKind") or "") == "configuration":
                 raise workflow_contracts.WorkflowConfigurationError(message)
             raise ValueError(message)
-        if status.get("failed"):
+        if status.get("failed") and status.get("failureKind") == "escalation":
+            nr.state, nr.error, nr.finished_at = "failed", status["error"], _now()
+        elif status.get("failed"):
             raise ValueError(status.get("error") or "企业发布链执行失败")
-        nr.output = status
-        if status.get("complete"):
+        elif status.get("complete"):
             nr.state, nr.finished_at = "succeeded", _now()
         else:
             nr.state = "waiting_external"
+        nr.output = status
     elif kind == "condition":
         cfg = dict(node.get("config") or {})
         value = (run.input or {}).get(str(cfg.get("inputKey") or ""))
@@ -1668,7 +1688,7 @@ async def _ai_execution_lost(session: AsyncSession, run: am.WorkflowRun, nr: am.
     nr.output = workflow_contracts.failure_output("infrastructure", executionLost={
         "seconds": elapsed, "polls": polls, "error": reason, "ref": str(ref or "")})
     cfg = await _node_config(session, run, nr.node_key)
-    await _begin_rework(session, run, nr, dict(cfg.get("onFailure") or {}), nr.error)
+    await _begin_rework(session, run, nr, stored_rework_policy(cfg, "onFailure"), nr.error)
     _event(session, run.id, "node.execution_lost", node_id=nr.id, detail={
         "node": nr.node_key, "seconds": elapsed, "polls": polls, "error": reason})
 
@@ -1711,7 +1731,7 @@ async def _poll_node(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun)
                 timeout={"limitSeconds": timeout_seconds, "elapsedSeconds": elapsed_seconds})
             _forget_output_settle(session, run, nr)
             await _begin_rework(
-                session, run, nr, dict(cfg.get("onFailure") or {}), nr.error)
+                session, run, nr, stored_rework_policy(cfg, "onFailure"), nr.error)
             _event(session, run.id, "node.timed_out", node_id=nr.id, detail={
                 "node": nr.node_key, "limitSeconds": timeout_seconds,
                 "elapsedSeconds": elapsed_seconds, "stopError": stop_error,
@@ -1736,7 +1756,7 @@ async def _poll_node(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun)
             _forget_output_settle(session, run, nr)
             cfg = await _node_config(session, run, nr.node_key)
             await _begin_rework(
-                session, run, nr, dict(cfg.get("onFailure") or {}), nr.error)
+                session, run, nr, stored_rework_policy(cfg, "onFailure"), nr.error)
             if nr.state != before:
                 _event(session, run.id, "node.failed" if nr.state == "failed" else "node.waiting",
                        node_id=nr.id, detail={"node": nr.node_key, "state": nr.state,
@@ -1902,14 +1922,17 @@ async def _poll_node(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun)
     elif nr.state == "waiting_human":
         req_id = str((nr.output or {}).get("requestId") or "")
         req = await session.get(am.ApprovalRequest, req_id) if req_id else None
-        if req and req.status in ("approved", "rejected", "cancelled"):
+        if req and req.status == "cancelled" and (req.context or {}).get("withdrawnBy"):
+            nr.state, nr.error, nr.finished_at = "failed", "审批已撤回，继续前需要重新发起审批", _now()
+            nr.output = {**(nr.output or {}), "failureKind": "escalation"}
+        elif req and req.status in ("approved", "rejected", "cancelled"):
             if req.status != "approved":
                 decisions = await release_control.decisions_for(session, req.id)
                 feedback = next((x.note for x in reversed(decisions)
                                  if x.decision == "reject" and x.note), "人工环节未通过")
                 cfg = await _node_config(session, run, nr.node_key)
                 if not await _begin_rework(
-                        session, run, nr, dict(cfg.get("onReject") or {}), feedback):
+                        session, run, nr, stored_rework_policy(cfg, "onReject"), feedback):
                     nr.state, nr.error, nr.finished_at = "failed", feedback[:1200], _now()
             elif nr.node_type == "deploy":
                 # Approval authorizes deployment but does not prove it happened.
@@ -1993,7 +2016,7 @@ async def _poll_node(session: AsyncSession, run: am.WorkflowRun, nr: am.NodeRun)
         cfg = await _node_config(session, run, nr.node_key)
         evidence = _rework_evidence(nr)
         await _begin_rework(
-            session, run, nr, dict(cfg.get("onFailure") or {}), evidence)
+            session, run, nr, stored_rework_policy(cfg, "onFailure"), evidence)
     if nr.state != before:
         _event(session, run.id, "node.succeeded" if nr.state == "succeeded" else
                "node.failed" if nr.state == "failed" else "node.waiting",
@@ -2211,7 +2234,7 @@ async def tick(session: AsyncSession) -> dict:
                     if run:
                         cfg = await _node_config(session, run, nr.node_key)
                         await _begin_rework(
-                            session, run, nr, dict(cfg.get("onFailure") or {}),
+                            session, run, nr, stored_rework_policy(cfg, "onFailure"),
                             _rework_evidence(nr))
                 if outbox is not None:
                     outbox.status, outbox.error, outbox.attempts = (

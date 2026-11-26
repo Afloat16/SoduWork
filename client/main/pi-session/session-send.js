@@ -37,8 +37,11 @@ async send(text, turnAttachments, sendOptions) {
       // cannot alter the active turn or capture an outdated selection.
       const requestedPluginIds = _pluginIds(Array.isArray(turn.pluginIds)
         ? turn.pluginIds : (turn.plugins || []).map((item) => item && item.pluginId));
+      // The host marks its accepted snapshot of an implicit selection. Renderer
+      // options cannot supply this marker through the normalized IPC boundary.
+      const inheritedPlugins = !requestedPluginIds.length || turn.inheritedPluginSelection === true;
       if (turn.clearPluginSelection === true) ctx.persistPluginSelection([]);
-      const effectivePluginIds = turn.clearPluginSelection !== true && requestedPluginIds.length
+      let effectivePluginIds = turn.clearPluginSelection !== true && requestedPluginIds.length
         ? requestedPluginIds.slice() : ctx.activePluginIds.slice();
       const accessReady = await ctx.liveAccess.wait();
       ctx.skillSelectionFailure = null;
@@ -48,6 +51,20 @@ async send(text, turnAttachments, sendOptions) {
         try { await ctx.accessChanges.apply(); }
         catch (error) { return { ok: false, retrySafe: true, reason: '权限变更未生效：' + String(error?.message || error) }; }
       }
+      if (interrupted() || ctx.closed) return { ok: true, cancelled: true, manualStop: true };
+      if (inheritedPlugins && turn.clearPluginSelection !== true &&
+          !turn.internal && !turn.controlled && !turn.taskId && !ctx.handle.taskRef && !ctx.handle.taskIds?.length &&
+          !turn.goalMode && !ctx.goalEnabled && !ctx.goalVisible && ctx.opts.intent !== 'goal' &&
+          turn.source !== 'automation' && !ctx.handle.appPluginId && !ctx.opts.appContext) {
+        try {
+          const retained = require('../personal-plugins').pruneUnavailableInherited(ctx.opts.app, effectivePluginIds);
+          if (retained.length !== effectivePluginIds.length) ctx.persistPluginSelection(retained);
+          effectivePluginIds = retained;
+        } catch (error) {
+          return { ok: false, failureKind: 'plugin-grant', retrySafe: true,
+            reason: '插件没能在发送前完成授权：' + String(error?.message || error) };
+        }
+      }
       const imageChoice = turn.modelName === undefined ? ctx.modelSelection.capture() : turn.modelName;
       if (require('./image-model').imageChoice(imageChoice)) {
         if (ctx.opts.readOnly) return { ok: false, retrySafe: true, reason: '当前是只读会话，请切换为可读写权限后再生成图片' };
@@ -56,14 +73,14 @@ async send(text, turnAttachments, sendOptions) {
         }
         ctx.inFlight = true;
         ctx.failedLastTurn = false;
-        ctx.imageController = new AbortController();
+        ctx.directModelController = new AbortController();
         runControl.resetTurn(ctx.run, true);
         ctx.displayTitle = ctx.displayTitle || titleForTurn(rawText);
         ctx.updatedAt = Date.now();
         try {
           await ctx.beginTurnJournal(turn);
           const result = await require('./image-turn').generate({ handle: ctx.handle, identity: ctx.identity, choice: imageChoice,
-            text: rawText, submissionId: turn.submissionId, signal: ctx.imageController.signal,
+            text: rawText, submissionId: turn.submissionId, signal: ctx.directModelController.signal,
             push: ev => ctx.acc.push(ev), emit: ctx._emit });
           ctx.failedLastTurn = !result.ok;
           return (deliveryResult = result);
@@ -72,7 +89,7 @@ async send(text, turnAttachments, sendOptions) {
           await ctx.finishTurnJournal();
           const capture = ctx._captureDirectDelivery(turn, deliveryResult);
           if (capture) await capture;
-          ctx.imageController = null; ctx.inFlight = false;
+          ctx.directModelController = null; ctx.inFlight = false;
           ctx._emit({ kind: 'turn-finished' }); queueMicrotask(ctx._drainTurns);
         }
       }
@@ -137,7 +154,7 @@ async send(text, turnAttachments, sendOptions) {
         return { ok: true, cancelled: true, manualStop: true };
       }
       // A rejected preflight must not make later plain messages inherit an unusable plugin.
-      if (turn.clearPluginSelection !== true && requestedPluginIds.length) ctx.persistPluginSelection(requestedPluginIds);
+      if (turn.clearPluginSelection !== true && requestedPluginIds.length) ctx.persistPluginSelection(effectivePluginIds);
       const internal = Boolean(turn.internal);
       if (!internal || !ctx.desktopControlScope) {
         ctx.desktopControlScope = 'pi:' + ctx.ref + ':' + require('node:crypto').randomUUID();
@@ -274,13 +291,20 @@ async send(text, turnAttachments, sendOptions) {
         // Native recovery remains part of the original logical submission.
         if (!(turn.internal && turn.runtimeRecovery) || !ctx.run.pluginGenerationTurn) ctx.run.pluginGenerationTurn = {};
         const pluginGenerationTurn = ctx.run.pluginGenerationTurn;
-        const permissionRevision = ctx.accessPolicy?.revision;
-        const repairCancelled = () => interrupted() || ctx.closed || ctx.goalCancelled ||
-          ctx.liveAccess.changing() || Boolean(ctx.accessChanges.pending()) || ctx.accessPolicy?.revision !== permissionRevision;
+        const startingPolicy = ctx.accessPolicy;
+        const startingSession = ctx.piSession;
+        const samePermissions = () => ctx.accessPolicy?.revision === startingPolicy?.revision;
+        const approvedInPlace = () => startingPolicy?.mode === 'standard' && ctx.accessPolicy?.mode === 'full' &&
+          ctx.piSession === startingSession && ctx.accessPolicy.workspaceRoot === startingPolicy.workspaceRoot &&
+          ctx.accessPolicy.revision === startingPolicy.revision + 1;
+        const turnInterrupted = () => interrupted() || ctx.closed || ctx.goalCancelled ||
+          ctx.liveAccess.changing() || Boolean(ctx.accessChanges.pending());
+        const repairCancelled = () => turnInterrupted() || !samePermissions();
         pluginGate = await require('./plugin-generation-gate.cjs').begin({
           handle: ctx.handle, app: ctx.opts.app, identity: ctx.identity, logicalOwner: pluginGenerationTurn,
           selectedPluginIds: effectivePluginIds,
-          cancelled: () => repairCancelled() || Boolean(ctx.run.stopReason),
+          cancelled: () => turnInterrupted() || Boolean(ctx.run.stopReason) || (!samePermissions() && !approvedInPlace()),
+          validationAllowed: samePermissions,
           pauseConfirmed: () => Boolean(ctx.limitRequest) && !repairCancelled(),
           changed: () => ctx._emit({ kind: 'plugin-validation' }),
           repair: async prompt => {

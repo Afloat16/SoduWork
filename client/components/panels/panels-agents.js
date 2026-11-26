@@ -250,7 +250,7 @@ async function _agLoad(force) {
 }
 
 function _agProbeContext(a) {
-  return JSON.stringify([a.key, a.version || '', a.bin || '', a.model || '', a.modelEffective || '',
+  return JSON.stringify([a.key, a.version || '', a.bin || '', a.model || '', a.modelProviderId || '', a.modelEffective || '',
     a.modelGone === true, a.configRevision || '', a.runtimeRevision || '']);
 }
 
@@ -355,12 +355,15 @@ function _agPresentation(a, ak) {
     && a.key === 'codex' && a.loginAvailable === true;
   const primaryAction = login ? 'login' : ['missing', 'setup', 'disabled', 'broken'].includes(state) ? 'install'
     : canProbe ? 'probe' : state === 'unknown' ? 'refresh' : 'details';
-  const primaryLabel = { missing: '装上', setup: '准备组件', disabled: '启用', broken: '修复安装',
+  const missingAdapter = state === 'missing' && a.key === 'dsh';
+  const primaryLabel = { missing: missingAdapter ? '安装适配器' : '装上', setup: '准备组件', disabled: '启用', broken: '修复安装',
     nollm: '选择模型', unauthed: login ? '连接 Codex' : '查看登录说明', unknown: '重新探测' }[state] || '测一下';
-  const reason = state === 'bad' ? _agMessage(null, '已安装，实际测试未通过。请查看下方测试结果并处理后重试。')
+  const reason = missingAdapter ? _agTx(a.desktopAppDetected === true
+    ? '已检测到 DeepSeek Harness App。安装 dsh-acp 适配器后即可配置执行。' : '未找到命令行适配器 dsh-acp。')
+    : state === 'bad' ? _agMessage(null, '已安装，实际测试未通过。请查看下方测试结果并处理后重试。')
     : state === 'broken' ? issue || _agMessage(a.whyMessage || a.why, '安装组件无法正常启动，请修复后重试。')
     : state === 'unknown' ? _agMessage(null, '状态暂时无法识别，请重新探测。') : _agMessage(a.whyMessage || a.why, issue || '');
-  return { state, label: info.t, tone: info.tone || state, reason, issue, installed, canProbe,
+  return { state, missingAdapter, label: missingAdapter ? '缺少适配器' : info.t, tone: info.tone || state, reason, issue, installed, canProbe,
     primaryAction, primaryLabel, probe, probeCurrent };
 }
 
@@ -386,11 +389,6 @@ function _agRender() {
   /* Keep the current instance identity on every action, even when only one card group is visible. */
   const machines = _agMachines();
   box.innerHTML = '<div id="agCustomAgents"></div>' +
-    (machines.length && _agData.modelCount === 0
-      /* This is HTML; Markdown emphasis would render literally. */
-      ? '<div class="ag-warn">你这台 SoduWork 现在一个模型都用不了，所以要模型的助手装了也派不了活。' +
-        '先去「我的模型」配一把 key，再回来测。</div>'
-      : '') +
     (machines.length ? machines.map(_agMachineHtml).join('')
       : '<div class="ag-blank">' + _AG_ICON + '<b>本机底座暂不可用</b><span>' +
         esc(_agData.env?.why || '当前客户端的 Runner 尚未连接，连接后会显示本机底座。') +
@@ -441,6 +439,10 @@ function _agMachineHtml(m) {
       '<div class="rn-overview"><span><b>' + upN + '</b> 已装</span>' +
       '<span><b>' + okN + '</b> 测通</span><span><b>' + list.length + '</b> 可管理</span></div>' +
     '</div>' +
+    (_agData?.modelCount === 0 && testN === 0 && list.some(a => presentation(a).state === 'nollm')
+      ? '<div class="ag-warn">你这台 SoduWork 现在一个模型都用不了，所以要模型的助手装了也派不了活。' +
+        '先去「我的模型」配一把 key，再回来测。</div>'
+      : '') +
     (okN === 0 && testN > 0
       ? '<div class="cfg-notice"><b>还没有测通的助手</b><span>点任一已安装助手上的「测一下」，会真跑一轮最小的活。</span></div>'
       : '') +
@@ -457,7 +459,7 @@ function _agRowHtml(a, m) {
   const ak = (rid ? rid + '~' : '') + a.key;   /* Drawer identity includes the machine because runtimes can exist on several machines. */
   const status = _agPresentation(a, ak), s = status.state, p = status.probe;
   const displayName = _agCopy(a, 'name', a.name || a.key);
-  const blurb = _agCopy(a, 'blurb', a.blurb || '');
+  const blurb = status.missingAdapter ? status.reason : _agCopy(a, 'blurb', a.blurb || '');
   const busy = _agJobs[ak]?.state === 'running';
   const bundled = !!a.bundled;
   const bot = window.AgentBrand
@@ -553,6 +555,10 @@ let _agDrawerShown = false;
    Offer the selector only for agents that use the shared model service. Codex
    use their own accounts and models; explain this instead of showing an ineffective selector,
    consistent with the milestone view. */
+function _agChoiceValue(row) {
+  return row.providerId ? JSON.stringify([row.providerId, row.name]) : row.name;
+}
+
 function _agModelHtml(a) {
   if (!a.modelPick) {
     return '<div class="ag-model is-own"><span class="ag-model-cap">模型</span>' +
@@ -568,15 +574,17 @@ function _agModelHtml(a) {
       (localHint || '<span class="ag-model-own">还没有能用的模型，先去「我的模型」配一把 key</span>') + '</div>';
   }
   const fallback = a.modelEffective || '';
-  const cur = a.modelAutomatic ? fallback : a.model || '';
+  const saved = a.modelAutomatic ? fallback : a.model || '';
+  const choice = list.find(row => row.name === saved && (!a.modelProviderId || a.modelProviderId === row.providerId));
+  const cur = choice ? _agChoiceValue(choice) : saved;
   const fallbackLabel = list.find(model => model.name === fallback)?.label || fallback;
   return '<div class="ag-model' + (a.modelGone ? ' is-bad' : '') + '">' +
     '<span class="ag-model-cap">模型</span>' +
     '<select class="ag-model-sel" data-amodel="' + esc(a.key) + '" data-amodel-value="' + esc(cur) + '">' +
       '<option value=""' + (cur ? '' : ' selected') + '>跟这台 SoduWork 的默认' +
         (fallback && !cur ? '（' + esc(fallbackLabel) + '）' : '') + '</option>' +
-      list.map(m => '<option value="' + esc(m.name) + '"' +
-        (m.name === cur ? ' selected' : '') + '>' + esc(m.label || m.name) +
+      list.map(m => '<option value="' + esc(_agChoiceValue(m)) + '"' +
+        (_agChoiceValue(m) === cur ? ' selected' : '') + '>' + esc(m.label || m.name) +
         (m.provider ? ' · ' + esc(_agTx(m.provider)) : '') +
         (m.providerKind === 'anthropic' ? ' · Anthropic' : '') +
         (m.keyFrom === 'mine' ? ' · 走我的额度' : '') + '</option>').join('') +
@@ -590,7 +598,7 @@ function _agModelHtml(a) {
     (list.some(m => m.providerKind === 'anthropic')
       ? '<span class="ag-model-warn" role="note">企业模型对话通道只支持 OpenAI 兼容协议；列表中的 Anthropic 模型需使用支持其协议的 Agent。</span>' : '') +
     (a.modelGone
-      ? '<span class="ag-model-warn">' + (a.localModelDefault
+      ? '<span class="ag-model-warn">' + (a.localModelDefault || a.modelProviderId
         ? '请主动选择可用模型后再执行，不会自动切换模型'
         : '这个模型现在用不了，派活会退回默认' + (fallback ? '（' + esc(fallback) + '）' : '')) + '</span>'
       : '') +
@@ -611,6 +619,8 @@ function _agBodyHtml(a, s, ak) {
   return '<div class="ag-row-b" id="ag-body-' + esc(ak) + '" role="region">' +
     '<div class="cfg-result is-' + status.tone + '"><span class="cfg-result-dot"></span>' +
       '<div><b>' + status.label + '</b><span>' + esc(why) + '</span></div></div>' +
+    (status.missingAdapter && a.desktopAppDetected !== true ? '<div class="ag-note">' +
+      esc(_agTx('如果你已安装 DeepSeek Harness App，还需安装命令行适配器，SoduWork 才能调用它。')) + '</div>' : '') +
     (status.issue && status.issue !== why ? '<div class="ag-note">' + esc(status.issue) + '</div>' : '') +
     (warn && !status.installed ? '<div class="ag-note">' + esc(warn) + '</div>' : '') +
     /* Group model settings with configuration instructions in the drawer. */
@@ -738,7 +748,8 @@ function _agBind(box) {
     const before = el.getAttribute('data-amodel-value') || '';
     el.disabled = true;
     try {
-      await SoduWorkAPI.setAgentModel(key, val);
+      const choice = (_agData?.models || []).find(row => _agChoiceValue(row) === val);
+      await SoduWorkAPI.setAgentModel(key, choice?.name || val, choice?.providerId);
       if (scope !== _agScopeEpoch) return;
       try { window.soduWorkAPI?.broadcast?.('models'); } catch (_) {}
       const hit = (_agData?.agents || []).find(x => x.key === key);
@@ -749,7 +760,7 @@ function _agBind(box) {
         const job = _agJobs[ak];
         if (_agParse(ak).key === key && job.action === 'probe' && job.state === 'done') job.context = '';
       });
-      if (hit) { hit.model = val; hit.modelGone = false; }
+      if (hit) { hit.model = choice?.name || val; hit.modelProviderId = choice?.providerId || ''; hit.modelGone = false; }
       if (typeof petSay === 'function') {
         petSay(val ? ('好，' + ((hit && hit.name) || key) + ' 以后用 ' + val)
           : (((hit && hit.name) || key) + ' 改回跟默认模型走'));

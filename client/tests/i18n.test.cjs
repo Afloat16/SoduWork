@@ -5,6 +5,41 @@ const fs = require('node:fs');
 const path = require('node:path');
 const script = fs.readFileSync(path.join(__dirname, '../core/i18n.js'), 'utf8');
 
+test('model catalog recovery and send guidance follow every supported locale', () => {
+  const c = client();
+  const phrases = [
+    '正在重试读取模型列表…',
+    '模型列表暂时无法读取，请检查连接或模型配置后重试；输入已保留。',
+    '读取模型列表超时，请检查连接后重试；输入已保留。',
+    '模型切换尚未确认，请稍候重试；当前请求仍在确认中，输入已保留。',
+    '模型切换未能确认，请重新选择模型后重试；输入已保留。',
+    '暂无可用模型，请检查模型配置后重试；输入已保留。',
+    '执行选项尚未确认，请稍候重试；输入已保留。',
+    '暂无可用模型，请检查模型配置',
+    '暂无可用模型，请检查模型服务授权。',
+    '云端 Agent 暂未提供模型列表。',
+    '该 Agent 暂未提供可切换的模型。',
+    '没有匹配的可用模型', '重新加载', '正在加载…',
+  ];
+  for (const phrase of phrases) {
+    const variants = ['zh-CN', 'en-US', 'ja-JP', 'ko-KR'].map(locale => {
+      c.api.setLocale(locale);
+      return c.api.translateText(phrase);
+    });
+    assert.equal(variants[0], phrase);
+    assert.equal(new Set(variants).size, 4, phrase);
+  }
+});
+
+test('delivery recovery guidance is translated in every supported locale', () => {
+  const c = client(), R = require('../core/requirements.js');
+  for (const code of ['capture_pending','capture_failed','sync_pending','review_unassigned']) {
+    const {guidance} = R.deliveryProgress({status:'doing',workRouting:{conversationTurn:{deliveryIssue:{code}}}});
+    const variants = ['zh-CN','en-US','ja-JP','ko-KR'].map(locale => c.api.translateText(guidance,locale));
+    assert.equal(new Set(variants).size,4,code);
+  }
+});
+
 test('installation verification guidance is available in every supported locale', () => {
   const c = client();
   for (const phrase of ['验证范围',
@@ -88,6 +123,19 @@ test('settings placeholders and screenshot notices follow every supported locale
   for (const [locale, values] of Object.entries(expected)) {
     c.api.setLocale(locale);
     assert.deepEqual(phrases.map(phrase => c.api.translateText(phrase)), values, locale);
+  }
+});
+
+test('invalid model configuration errors follow every supported locale', () => {
+  const c = client();
+  for (const [locale, expected] of [
+    ['zh-CN', '模型配置必须是 JSON 对象'],
+    ['en-US', 'Model configuration must be a JSON object.'],
+    ['ja-JP', 'モデル設定は JSON オブジェクトで指定してください。'],
+    ['ko-KR', '모델 설정은 JSON 객체여야 합니다.'],
+  ]) {
+    c.api.setLocale(locale);
+    assert.equal(c.api.translateText('模型配置必须是 JSON 对象'), expected, locale);
   }
 });
 
@@ -306,6 +354,15 @@ test('localized slash actions resolve to the same work contract and preserve req
     assert.equal(result.text, '保存 this request');
   }
 });
+test('website packaging guidance follows every existing renderer locale', () => {
+  const c = client(), catalogs = require('../core/locales/builtin-ui');
+  const phrases = ['文件夹包含超过12层的文件，请将文件移近所选文件夹后重试', '文件夹打包失败'];
+  for (const locale of ['zh-CN', 'en-US', 'ja-JP', 'ko-KR']) {
+    c.api.setLocale(locale);
+    for (const phrase of phrases) assert.equal(c.api.translateText(phrase), catalogs[locale][phrase], locale);
+  }
+});
+
 function client(saved = {}, blocked = false, options = {}) {
   const storage = options.storage || new Map(Object.entries(saved)), listeners = new Map(), sent = [];
   const context = vm.createContext({
@@ -775,6 +832,7 @@ test('publication notices translate in every shipped locale while retaining exac
 test('collaboration card actions, permissions and summaries use shipped locale entries', () => {
   const c = client();
   const samples = [
+    '验收状态暂时无法读取，请重新打开需求重试。',
     '停止协作', '恢复协作', '收起协作卡，执行不会停止', '核对执行状态',
     '成果承载区尚未就绪，请重新打开对话', '完成流程，保留结果', '需要你的许可',
     '操作内容未完整提供。请拒绝本次操作，并让 Agent 提供明确、简短的操作。',

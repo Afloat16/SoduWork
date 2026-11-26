@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from app import models
+from app import conversation_handoff_models  # noqa: F401  Register archive owners for attachment cleanup.
 from app.services import attachment_ownership, mate_message_files as shares, storage, team
 from app.api.attachments import (delete_attachment, download_attachment,
                                  list_conversation_media,
@@ -50,6 +51,32 @@ class MateFilesTests(unittest.IsolatedAsyncioTestCase):
         body=b"".join([chunk async for chunk in response.body_iterator])
         self.assertEqual(body,b"pptx-binary\x00\xff")
         self.assertIn("attachment;",response.headers["content-disposition"])
+
+    async def test_passive_uploads_keep_exact_bytes_and_participant_only_access(self):
+        from urllib.parse import urlparse, parse_qs
+        files = {"程序员笑话.txt": "<script>not executable</script>\n笑话".encode(),
+                 "截图.png": b"\x89PNG\r\n\x1a\nfixture", "说明.pdf": b"%PDF-1.7\nfixture"}
+        self.payload["files"] = [dict(name=name, data=base64.b64encode(data).decode(),
+                                      contentType="text/html") for name, data in files.items()]
+        rows = await self.save()
+        for row in rows:
+            self.assertEqual(set(row), {"id", "name", "size"})
+            for uid in ("sender", "recipient"):
+                meta = await shares.access(self.session, SimpleNamespace(user_ref=uid), row["id"])
+                self.assertEqual(meta["filename"], row["name"])
+                self.assertEqual(meta["contentType"], "application/octet-stream")
+                ticket = parse_qs(urlparse(meta["url"]).query)["ticket"][0]
+                response = await download_attachment(row["id"], ticket, "preview", self.session)
+                self.assertEqual(b"".join([chunk async for chunk in response.body_iterator]), files[row["name"]])
+                self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+                self.assertIn("sandbox", response.headers["content-security-policy"])
+            with self.assertRaises(HTTPException) as denied:
+                await shares.access(self.session, SimpleNamespace(user_ref="other"), row["id"])
+            self.assertEqual(denied.exception.status_code, 404)
+        with patch.object(team, "_company_members", new=AsyncMock(return_value=[])):
+            for uid in ("sender", "recipient"):
+                with self.assertRaises(HTTPException):
+                    await shares.access(self.session, SimpleNamespace(user_ref=uid), rows[0]["id"])
 
     async def test_conversation_video_owner_can_refresh_and_delete(self):
         key="conversation-media/device/conversation-a/video/video.mp4"
@@ -119,7 +146,7 @@ class MateFilesTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(storage,"put",side_effect=put):
             with self.assertRaises(OSError):await self.save()
         from pathlib import Path
-        self.assertEqual(list(Path(self.temp.name).iterdir()),[])
+        self.assertEqual([path for path in Path(self.temp.name).rglob("*") if path.is_file()], [])
         self.assertEqual(list((await self.session.execute(select(models.Attachment))).scalars()),[])
 
     async def test_actual_notice_contains_recipient_bound_files_without_payload_or_tickets(self):
