@@ -169,3 +169,107 @@ for (const valid of [true, false]) {
     assert.deepEqual(await fs.readdir(path.dirname(f.target)), [path.basename(f.target)]);
   });
 }
+
+for (const code of ['ENOTSUP', 'EOPNOTSUPP', 'EPERM']) {
+  test(`a filesystem rejecting hard links with ${code} creates and reuses a complete ZIP`, async t => {
+    const f = await fixture(t);
+    t.mock.method(fs, 'link', async () => { throw Object.assign(Error('hard links unavailable'), { code }); });
+    const target = await create(f.input);
+    assert.equal(path.basename(target), f.result.filename);
+    assert.equal(path.dirname(path.dirname(target)), path.dirname(path.dirname(f.target)), 'the cache stays under the same owner');
+    assert.deepEqual(await fs.readFile(target), f.result.bytes);
+    const past = new Date('2020-01-01T00:00:00Z');
+    await fs.utimes(target, past, past);
+    const opened = t.mock.method(fs, 'open', async () => { throw Error('cached archives need no write'); });
+    assert.equal(await create(f.input), target);
+    assert.equal(opened.mock.callCount(), 0);
+    assert.equal((await fs.stat(target)).mtimeMs, past.getTime());
+  });
+}
+
+for (const action of ['open-archive', 'open-local']) {
+  test(`a partial write retries through ${action} without hard-link support`, async t => {
+    const f = await fixture(t), write = fs.writeFile;
+    t.mock.method(fs, 'link', async () => { throw Object.assign(Error('hard links unavailable'), { code: 'ENOTSUP' }); });
+    const fault = t.mock.method(fs, 'writeFile', async (file, bytes, options) => {
+      await write(file, bytes.subarray(0, 5), options);
+      throw Object.assign(Error('disk full after a partial write'), { code: 'ENOSPC' });
+    });
+    assert.equal((await f.action(action)).ok, false);
+    assert.deepEqual(f.calls, []);
+    await assert.rejects(fs.stat(f.target), { code: 'ENOENT' });
+    fault.mock.restore();
+    const retried = await f.action(action);
+    assert.equal(retried.ok, true, JSON.stringify(retried));
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0][0], action === 'open-archive' ? 'open' : 'reveal');
+    assert.deepEqual(await fs.readFile(f.calls[0][1]), f.result.bytes);
+  });
+}
+
+test('renamed bundles at the same revision retain both ZIPs without hard links', async t => {
+  const f = await fixture(t);
+  await create(f.input);
+  t.mock.method(fs, 'link', async () => { throw Object.assign(Error('hard links unavailable'), { code: 'ENOTSUP' }); });
+  assert.equal(await create(f.input), f.target, 'existing legacy archives keep their original path');
+  const renamed = { ...f.input, result: { ...f.result, filename: 'Renamed delivery.zip' } };
+  const renamedTarget = await create(renamed);
+  assert.equal(path.basename(renamedTarget), renamed.result.filename);
+  const again = { ...renamed, result: { ...renamed.result, filename: 'Another title.zip' } };
+  const anotherTarget = await create(again);
+  assert.equal(path.basename(anotherTarget), again.result.filename);
+  assert.notEqual(renamedTarget, anotherTarget);
+  for (const target of [f.target, renamedTarget, anotherTarget]) {
+    assert.deepEqual(await fs.readFile(target), f.result.bytes);
+  }
+  assert.equal(await create(renamed), renamedTarget);
+});
+
+for (const valid of [true, false]) {
+  test(`a concurrently published ${valid ? 'valid' : 'different'} fallback ZIP is never overwritten`, async t => {
+    const f = await fixture(t), rename = fs.rename;
+    const replacement = valid ? f.result.bytes : Buffer.from('independent ZIP bytes');
+    t.mock.method(fs, 'link', async () => { throw Object.assign(Error('hard links unavailable'), { code: 'ENOTSUP' }); });
+    let competingTarget;
+    const fault = t.mock.method(fs, 'rename', async (staging, destination) => {
+      assert.deepEqual(await fs.readdir(staging), [f.result.filename]);
+      assert.deepEqual(await fs.readFile(path.join(staging, f.result.filename)), f.result.bytes);
+      await fs.mkdir(destination);
+      competingTarget = path.join(destination, f.result.filename);
+      await fs.writeFile(competingTarget, replacement, { flag: 'wx' });
+      return rename(staging, destination);
+    });
+    if (valid) assert.equal(await create(f.input), competingTarget);
+    else await assert.rejects(create(f.input), { code: 'DELIVERY_ARCHIVE_INVALID' });
+    assert.equal(fault.mock.callCount(), 1);
+    assert.deepEqual(await fs.readFile(competingTarget), replacement);
+    assert.deepEqual(await fs.readdir(path.dirname(competingTarget)), [f.result.filename]);
+  });
+}
+
+test('a failed fallback publication preserves a concurrent legacy ZIP and can retry', async t => {
+  const f = await fixture(t);
+  const failure = Object.assign(Error('directory publication failed'), { code: 'EIO' });
+  t.mock.method(fs, 'link', async () => { throw Object.assign(Error('hard links unavailable'), { code: 'ENOTSUP' }); });
+  const fault = t.mock.method(fs, 'rename', async () => {
+    await fs.writeFile(f.target, f.result.bytes, { flag: 'wx' });
+    throw failure;
+  });
+  await assert.rejects(create(f.input), error => error === failure);
+  assert.deepEqual(await fs.readFile(f.target), f.result.bytes);
+  fault.mock.restore();
+  assert.equal(await create(f.input), f.target);
+  assert.deepEqual(await fs.readFile(f.target), f.result.bytes);
+});
+
+test('an ordinary hard-link I/O failure is reported without attempting fallback publication', async t => {
+  const f = await fixture(t);
+  const failure = Object.assign(Error('link failed'), { code: 'EIO' });
+  const link = t.mock.method(fs, 'link', async () => { throw failure; });
+  const rename = t.mock.method(fs, 'rename', async () => { throw Error('unexpected fallback'); });
+  await assert.rejects(create(f.input), error => error === failure);
+  assert.equal(rename.mock.callCount(), 0);
+  await assert.rejects(fs.stat(f.target), { code: 'ENOENT' });
+  link.mock.restore(); rename.mock.restore();
+  assert.equal(await create(f.input), f.target);
+});
