@@ -1635,14 +1635,15 @@
      * who={id,type} selects an agent or squad; omit it to use the configured default. brief
      * adds task-specific instructions.
      */
-    async dispatchToAI(tid, who, brief, repo, model, executionContext, submissionMode) {
+    async dispatchToAI(tid, who, brief, repo, model, executionContext, submissionMode, inputManifest) {
       // All interactive task entries use the same conversation send queue.
       // The main process invokes the authorized executor only at the head.
+      const confirmed = inputManifest !== undefined;
       const native = window.NativeChat;
       if (native && typeof native.enqueueTask === 'function') {
         const result = await native.enqueueTask(tid, { source: 'task-dispatch', agentId: who && who.id || '',
           assigneeType: who && who.type || 'agent', brief, repo, model, executionContext,
-          ...(submissionMode ? { submissionMode } : {}) });
+          ...(submissionMode ? { submissionMode } : {}), ...(confirmed ? { inputManifest } : {}) });
         if (!result || result.ok === false) {
           const error = new Error(result && (result.reason || result.error || result.message) || '需求未能进入会话队列');
           // Explicit business refusals use the same display contract as HTTP errors.
@@ -1658,7 +1659,8 @@
       if (model) b.model = String(model);     /* Per-request model override; empty uses the agent's configuration. */
       if (executionContext) b.executionContext = executionContext;
       if (submissionMode) b.submissionMode = submissionMode;
-      var r = await jfetch('/tasks/' + encodeURIComponent(tid) + '/ai-dispatch',
+      if (confirmed) b.inputManifest = inputManifest;
+      var r = await jfetch('/tasks/' + encodeURIComponent(tid) + (confirmed ? '/ai-dispatch-confirmed' : '/ai-dispatch'),
         { method: 'POST', body: JSON.stringify(b) });
       mark(true);
       if (r && r.ok === false) {

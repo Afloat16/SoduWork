@@ -472,8 +472,9 @@ class UnifiedRequirementTests(unittest.IsolatedAsyncioTestCase):
         from app.services import ai_exec, agent_runner, conversation_turns, device_auth, workflow_runs
         response = await self.call("PATCH", "tasks/shared", json={"archivedAt": 1234567890000})
         self.assertEqual(response.status_code, 200, response.text)
-        for path, body in (("ai-dispatch", {}), ("conversation-turn", {
-                "action": "prepare", "turnId": "test-turn", "conversationId": "test-chat"})):
+        for path, body in (("ai-dispatch", {}),
+                ("ai-dispatch-confirmed", {"executionContext": {"strategy": "direct"}, "inputManifest": []}),
+                ("conversation-turn", {"action": "prepare", "turnId": "test-turn", "conversationId": "test-chat"})):
             headers = {}
             if path == "conversation-turn":
                 headers["Authorization"] = "Device " + device_auth.issue_session(self.clients["owner"])[0]
