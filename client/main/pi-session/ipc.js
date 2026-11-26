@@ -1008,6 +1008,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     if (!s) return { ok: false, code: 'SESSION_NOT_FOUND', notSent: true, reason: '这条对话已经不在了（可能已关闭）' };
     if (s.localReplica === true) return { ok: false, accepted: false, notSent: true,
       reason: '本地历史为只读，请使用当前账号新建会话继续' };
+    const confirmedTaskInput = Object.hasOwn(rawOptions?.taskExecution ?? {}, 'inputManifest');
     let selectedSkills;
     try { selectedSkills = skillTurn.names(rawOptions?.skills); }
     catch (error) { return skillTurn.failure(error); }
@@ -1056,7 +1057,13 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     } catch (error) { return { ok: false, reason: String(error.message || error) }; }
     try {
       if (session.get(ref) !== s) throw Error('账号已切换，请重新打开会话');
-      if (_cloudHandoff.guard(s)) return await _cloudHandoff.send(s, text, rawAttachments, rawOptions || {});
+      if (_cloudHandoff.guard(s)) {
+        // An existing cloud conversation accepts follow-up text, not task
+        // dispatch manifests. Do not drop a confirmed input selection.
+        if (confirmedTaskInput) return { ok: false, accepted: false, notSent: true,
+          reason: '当前云端会话不能使用已确认的派发材料，请从需求派发入口重新确认' };
+        return await _cloudHandoff.send(s, text, rawAttachments, rawOptions || {});
+      }
     } catch (error) { return { ok: false, reason: String(error.message || error) }; }
     // Scheduled automation is an ordinary one-turn conversation even when the
     // selected personal plugin happens to be a workflow package.  The debug

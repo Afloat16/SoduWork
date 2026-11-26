@@ -85,6 +85,12 @@ Older Hubs could keep a handoff receipt after deleting its task and archive. An 
 
 For a missing active object, use the reported key to locate its database record and a trusted backup from the same deployment. Early Windows installations may have stored bytes in an NTFS named stream. Check ownership and verify the recovered ordinary file against the recorded length and SHA-256 where available. With Hub stopped, place that verified copy at the v2 path for the exact key in the restore copy, preserving the original backup. If ownership or content cannot be established, keep the originals for review. A successful startup and a download matching the original bytes verify recovery. To roll back, stop Hub and restore the old database and uploads volume together before restarting the old version.
 
+### Task attachment quotas and crash recovery
+
+Set `ATTACH_OWNER_QUOTA_BYTES` or `ATTACH_ORG_QUOTA_BYTES` to cap the total size of ordinary task attachments uploaded by a device or administrator. An unset limit is unlimited. Zero disables uploads in that scope. Account uploads count toward the original uploader and their current organization. Unaffiliated and device-only uploads share the unassigned organization pool.
+
+The Hub records pending object writes before uploading them. After a restart it checks the attachment database and removes unfinished objects. The records default to `uploads/.ingest` and use the same durable storage requirement with MinIO. For a read-only Hub filesystem, set `ARTIFACT_STAGING_DIR` to an absolute path on a writable persistent volume. Hub workers that share a database and object store should share this volume.
+
 ### Read-only automation
 
 Use the configured Hub address. The local development example below uses port 9080. The health check is public. To list the projects visible to an account, obtain its bearer token through `POST /api/v1/admin/login` and provide it in `HUB_TOKEN` through your environment or CI secret store. The account needs the `task.view` permission.
