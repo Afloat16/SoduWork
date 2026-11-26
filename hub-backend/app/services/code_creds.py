@@ -153,12 +153,40 @@ def probe_fingerprint(client) -> str:
 
 # Git subprocess environment.
 def _helper_script() -> str:
-    """Use this task owner's HTTPS account; credentials remain in the environment."""
-    return ('!f(){ echo "username=$SODUWORK_GIT_USER"; '
-            'echo "password=$SODUWORK_GIT_TOKEN"; }; f')
+    """Use this task owner's HTTPS account; credentials remain in the environment.
+
+    The helper only answers for hosts this execution is allowed to reach. Git
+    sends the requested protocol and host on stdin, so the helper can refuse a
+    host outside the allow-list instead of handing the token to whoever asks.
+    """
+    return ('!f(){ h=""; while IFS= read -r l; do case "$l" in host=*) h="${l#host=}";; esac; done; '
+            'case ";${SODUWORK_GIT_ALLOWED_HOSTS};" in *";$h;"*) '
+            'echo "username=$SODUWORK_GIT_USER"; echo "password=$SODUWORK_GIT_TOKEN";; esac; }; f')
 
 
-def env_for(env: dict, git: dict, *, ref: str = "") -> dict:
+def _allowed_hosts(url: str) -> str:
+    """Hosts a credential helper may answer for, taken from the repository URL.
+
+    The URL host is the only host this execution is meant to reach, so the
+    helper stays scoped to it. An unusable URL yields an empty list, which
+    makes the helper decline every request.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        rest = text.split("://", 1)[1]
+    else:
+        # scp-like syntax: [user@]host:path
+        rest = text.split(":", 1)[0] if ":" in text else ""
+        rest = rest.rsplit("@", 1)[-1]
+    host = rest.split("/", 1)[0]
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    return host.strip().lower()
+
+
+def env_for(env: dict, git: dict, *, ref: str = "", url: str = "") -> dict:
     """Inject resolved Git identity and credentials into env in place. Empty credentials preserve
     executor defaults.
     """
@@ -181,6 +209,11 @@ def env_for(env: dict, git: dict, *, ref: str = "") -> dict:
     if token:
         env["SODUWORK_GIT_USER"] = str(git.get("user") or name or "git")
         env["SODUWORK_GIT_TOKEN"] = token
+        # Scope the helper to the host this execution may reach. Without it the
+        # helper answers every host git asks about, which sends the token to
+        # whichever address the request happened to target.
+        allowed = _allowed_hosts(url)
+        env["SODUWORK_GIT_ALLOWED_HOSTS"] = allowed
         # The empty credential.helper entry must precede the custom helper.
         # It clears inherited helpers such as Git Credential Manager.
         # Otherwise interactive credential handling can stall an unattended command.
@@ -269,7 +302,7 @@ def probe_sync(git: dict, url: str) -> dict:
     env = dict(os.environ)
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         env.pop(k, None)                 # Validate credentials by connecting directly to the repository service.
-    env = env_for(env, git, ref="probe")
+    env = env_for(env, git, ref="probe", url=url)
     try:
         p = subprocess.run(["git", "-c", "http.proxy=", "-c", "https.proxy=",
                             "ls-remote", "--heads", url],
