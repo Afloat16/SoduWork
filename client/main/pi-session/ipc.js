@@ -62,7 +62,8 @@ function _skillDirs(app) {
  */
 function _contextSnapshot(handle, snapshot) {
   const { usageReceipts, ...display } = snapshot || {};
-  return { ...display, ...(handle.requirementContext ? { requirementContext: handle.requirementContext } : {}),
+  const skillFailure = require('./skill-failure-context.cjs').summary(handle, display);
+  return { ...display, ...(skillFailure ? { skillFailure } : {}), ...(handle.requirementContext ? { requirementContext: handle.requirementContext } : {}),
     ...(handle.deliverySync ? { deliverySync: handle.deliverySync } : {}) };
 }
 function _send(win, handle, touched, snapshot, includeSnapshot, presenceSnapshot) {
@@ -71,6 +72,7 @@ function _send(win, handle, touched, snapshot, includeSnapshot, presenceSnapshot
   const safePluginAuthorization = includeSnapshot && typeof eventPublication.pluginAuthorization === 'function'
     ? eventPublication.pluginAuthorization(touched?.pluginAuthorization) : undefined;
   try {
+    const presenceRow = typeof handle.historyRow === 'function' ? handle.historyRow(presenceSnapshot || snapshot) : null;
     win.webContents.send('pi-session-event', {
       ref: handle.ref, sessionId: handle.sessionId,
       kind: touched && touched.kind,
@@ -81,8 +83,8 @@ function _send(win, handle, touched, snapshot, includeSnapshot, presenceSnapshot
       ...(includeSnapshot ? require('../../core/token-quota').fields(touched) : {}),
       ...(safePluginAuthorization ? { pluginAuthorization: safePluginAuthorization } : {}),
       snapshot: includeSnapshot ? _contextSnapshot(handle, snapshot) : null,
-      presence: conversationTitles.decorate(_app, typeof handle.historyRow === 'function'
-        ? { ...handle.historyRow(presenceSnapshot || snapshot), ...(handle.requirementContext ? { requirementContext: handle.requirementContext } : {}) } : null),
+      presence: conversationTitles.decorate(_app, presenceRow
+        ? { ...presenceRow, ...(handle.requirementContext ? { requirementContext: handle.requirementContext } : {}) } : null),
       ...(handle.requirementContext ? { requirementContext: handle.requirementContext } : {}),
       taskId: String(touched && touched.taskId || snapshot && snapshot.execution && snapshot.execution.turnQueue && snapshot.execution.turnQueue.activeTaskId || ''),
       taskTitle: String(handle.taskTitle || ''),
@@ -170,6 +172,7 @@ function _discardRenderer(handle) {
 
 function _bindUsage(handle, identity, adapterId) {
   if (!handle || !identity) return;
+  require('./skill-failure-context.cjs').bind(_app, handle, identity);
   _deliverySync?.bind(handle, identity);
   _accountSync?.bind(handle, identity);
   handle.usageIdentity = {
@@ -214,6 +217,7 @@ function _attach(handle, win) {
 function _openReply(handle, extra) {
   const reply = require('./open-reply').openReply(_app, handle, extra);
   if (handle.localReplica === true) return reply;
+  reply.snapshot = _contextSnapshot(handle, reply.snapshot);
   const context = require('../conversation/requirement-context').publicContext(_app, handle.sessionId);
   if (context) {
     reply.requirementContext = context;
@@ -261,6 +265,11 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       };
       return Reflect.get(target, property);
     },
+  });
+  const firstTurnTitle = require('../conversation/first-turn-title').create({
+    app, identityOf: sendIdentityOf || identityOf, authorizeAI,
+    isCurrent: handle => session.get(handle.ref) === handle && !_cloudHandoff.guard(handle) &&
+      !session.isArchived(app, handle.sessionId),
   });
   _deliverySync = require('../conversation/local-delivery-sync').create({
     notify: handle => _push(BrowserWindow, handle, { kind: 'delivery-sync' }, handle.snapshot()) });
@@ -796,7 +805,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         accessPolicy: spec.accessPolicy,
         skillDirs: spec.skillDirs, optionalSkillDirs: spec.optionalSkillDirs,
         resolveSkills: skillTurn.resolver({ app, identity, identityOf: sendIdentityOf || identityOf,
-          skillDirs: () => _skillDirs(app) }),
+          skillDirs: () => _skillDirs(app),
+          onResolved: (submissionId, items) => require('./skill-failure-context.cjs').prepared(session.get(ref), submissionId, items) }),
         resolveConnectors: require('../conversation-connectors.cjs').resolver({ app, identity, identityOf: sendIdentityOf || identityOf,
           ref, allowed: (resolved.skills || []).some(row => row.name === 'mcp-tools'), explicitlySelected: spec.selectedSkills.includes('mcp-tools') }),
         taskRef: spec.taskRef, taskTitle: spec.taskTitle,
@@ -920,6 +930,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         appRequest?.assertActive();
         const reply = _openReply(opened.session, { resumed: !!resume, seeded: opened.seeded || 0 });
         accessConsent?.commit();
+        if (!resume && !opts.sessionTitle && !spec.taskRef && !automationContext && !appRequest &&
+            !appPluginId && !opts.nativeRelay && !opened.seeded) firstTurnTitle.enroll(opened.session);
         return reply;
       } catch (error) {
         await closeFailedOpen(opened.session);
@@ -1056,6 +1068,10 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     if (debugBlocked) return { ok: false, reason: debugBlocked };
     let taskTurn = null;
     const taskId = String(rawOptions && rawOptions.taskId || '').trim().slice(0, 120);
+    require('../requirement-diagnostics.cjs').record('native.send', {taskId,conversationId:s.sessionId,
+      turnId:rawOptions?.submissionId,hasTaskBinding:!!taskId,selectedMode:rawOptions?.taskExecution?.submissionMode,
+      runtimeKey:s.adapterId,modelKey:typeof s.model==='string'?s.model:(s.model?.id || s.model?.name),workspaceKey:s.cwd,
+      hubKey:currentIdentity?.hub,accountKey:require('../device-auth-request').accountScopeKey(currentIdentity)});
     const followUpTurn = !!(rawOptions && rawOptions.taskExecution && rawOptions.taskExecution.followUp === true);
     if (taskId) {
       try {
@@ -1072,6 +1088,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       } catch (error) {
         // Only an explicitly finished task permits an ordinary follow-up without a receipt.
         // Active receipts, permission failures and network errors must not lose task delivery silently.
+        require('../requirement-diagnostics.cjs').record('native.error',{taskId,conversationId:s.sessionId,
+          turnId:rawOptions?.submissionId,httpStatus:Number(error.status)||0,errorKey:String(error.message || error)});
         if (!followUpTurn || error.code !== 'TASK_FINISHED' || rawOptions.taskExecution?.executionChoice === 'native') return { ok: false, reason: String(error.message || error) };
         console.warn('[task-input] 续轮收据未挂上，按普通会话发送：' + String((error && error.message) || error));
         taskTurn = null;
@@ -1112,6 +1130,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     const clearPluginSelection = Boolean(rawOptions &&
       (rawOptions.clearPluginSelection === true || rawOptions.pluginSelection === 'clear'));
     const sendOptions = {
+      ...(automationTurn ? { source: 'automation' } : {}),
       ...(taskTurn?.acceptanceOnly ? { beforeTurn: taskTurn.beforeTurn, afterTurn: taskTurn.afterTurn,
         promptText: taskTurn.text } : {}),
       ...(taskLifecycle ? { taskId, taskTitle: taskTurn.task.title || '',
@@ -1127,7 +1146,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       projectId: String(taskTurn ? taskTurn.task.projectId || '' : rawOptions && rawOptions.projectId || '').slice(0, 36),
       repoId: String(taskTurn ? taskTurn.task.repoId || '' : rawOptions && rawOptions.repoId || '').slice(0, 36),
       submissionId: String(taskTurn?.acceptanceOnly ? taskTurn.submissionId : rawOptions && rawOptions.submissionId || '')
-        .replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64),
+        .replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || (selectedSkills.length || (rawOptions?.skills == null && s.ui?.selectedSkills?.length) ? require('crypto').randomUUID() : ''),
     };
     if (typeof authorizeAI === 'function') {
       // Resolve ownership for each captured turn, not the session's current
@@ -1164,6 +1183,12 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       try { await rawOptions.nativeRelayGuard(); }
       catch (error) { return { ok: false, accepted: false, reason: String(error.message || error) }; }
     }
+    if (!workflowTurn && rawOptions?.skills == null && s.ui?.selectedSkills?.length) {
+      const active = (s.ui.skills || []).filter(row => s.ui.selectedSkills.includes(row.name));
+      require('./skill-failure-context.cjs').prepared(s, sendOptions.submissionId, active);
+    }
+    const titleRequest = !workflowTurn && !taskId && !automationTurn && !appRequest && !rawOptions?.nativeRelayGuard
+      ? firstTurnTitle.prepare(s, text) : null;
     const submitted = workflowTurn || (typeof s.submit === 'function'
       ? await s.submit(text, staged.files, sendOptions)
       : { accepted: true, queued: false, completion: s.send(text, staged.files, sendOptions) });
@@ -1171,6 +1196,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       if (taskTurn?.afterTurn) await taskTurn.afterTurn('stopped').catch(() => {});
       return submitted.result || { ok: false, reason: '这条消息没有被接收' };
     }
+    if (!submitted.queued) void firstTurnTitle.accepted(s, titleRequest);
     if (observe) observe(Promise.resolve(submitted.completion));
     Promise.resolve(submitted.completion).then((r) => {
       if (!r || !r.ok) _publish(BrowserWindow, s, {
@@ -1247,7 +1273,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     if (!s) return { ok: false, accepted: false, reason: '这条对话已经不在了（可能已关闭）' };
     if (_cloudHandoff.guard(s)) return { ok: false, accepted: false, reason: '请先处理云端交接，再操作本地队列' };
     try {
-      const result = await Promise.resolve(s.cancel());
+      const result = await Promise.resolve(s.cancel({ userInitiated: true }));
       const snapshot = typeof s.uiSnapshot === 'function' ? s.uiSnapshot() : s.snapshot();
       return { ...(result || { ok: true, accepted: true }),
         snapshot: _contextSnapshot(s, snapshot) };
@@ -1259,7 +1285,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   // after the first click. Keep the legacy one-way channel for older windows
   // and test fixtures that still use ipcRenderer.send().
   ipcMain.handle('pi-session-cancel-request', (_event, ref) => cancelSession(ref));
-  ipcMain.on('pi-session-cancel', (event, ref) => { const s = session.get(ref); if (s) s.cancel(); });
+  ipcMain.on('pi-session-cancel', (event, ref) => { const s = session.get(ref); if (s) s.cancel({ userInitiated: true }); });
   require('./artifact-ipc').install({ app, ipcMain, BrowserWindow, session, workDir,
     resolveSession: handle => _cloudHandoff.artifactSession(handle) });
   require('../conversation/local-delivery-action').install({ app, ipcMain, session, shell,

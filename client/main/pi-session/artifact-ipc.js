@@ -12,6 +12,7 @@ const { shell, nativeImage, dialog } = require('electron');
 const imageClipboard = require('../conversation/image-clipboard');
 
 function install({ app, ipcMain, BrowserWindow, session, workDir, resolveSession = async handle => handle }) {
+  ipcMain.handle('pi-session-skill-failure-context', require('./skill-failure-context.cjs').handler({ session, BrowserWindow }));
   require('./tool-detail-ipc').install({ ipcMain, session, BrowserWindow });
   require('../conversation/delivery-package-ipc').install({ ipcMain, session, BrowserWindow, dialog, resolveSession });
 async function _attachmentTarget(handle, ref, token) {
@@ -58,7 +59,7 @@ async function _attachmentImage(handle, ref, token) {
 }
 
 
-  ipcMain.handle('pi-session-outputs', async (event, ref) => { const s = session.get(ref); if (!s) return { ok: false, reason: '\u4f1a\u8bdd\u4e0d\u5728\u4e86' }; try { const { got, delivery, items } = await artifactRuntime.snapshotAsync(await resolveSession(s)); const artifacts = artifactRuntime.decorate(ref, { items }); return { ok: true, files: got.files || [], deliverables: delivery.items || [], artifacts, delivery, cloudOutputs: got.cloudOutputs, truncated: Boolean(got.truncated) }; } catch (e) { return { ok: false, reason: String((e && e.message) || e) }; } });
+  ipcMain.handle('pi-session-outputs', async (event, ref) => { const s = session.get(ref); if (!s) return { ok: false, reason: '\u4f1a\u8bdd\u4e0d\u5728\u4e86' }; try { const { got, delivery, items } = await artifactRuntime.snapshotAsync(await resolveSession(s)); const artifacts = await artifactRuntime.decorateForSharing(ref, { items }); return { ok: true, files: got.files || [], deliverables: delivery.items || [], artifacts, delivery, cloudOutputs: got.cloudOutputs, truncated: Boolean(got.truncated) }; } catch (e) { return { ok: false, reason: String((e && e.message) || e) }; } });
 
   ipcMain.handle('mate-message-pick-folder', mateMessageIpc.createPickFolderHandler({ BrowserWindow, dialog, shareArchive }));
   ipcMain.handle('pi-session-artifact-action', async (event, ref, artifactId, action) => {
@@ -67,7 +68,8 @@ async function _attachmentImage(handle, ref, token) {
     try {
       return await artifactRuntime.action(await resolveSession(s), ref, artifactId, action, { shell, nativeImage });
     } catch (error) {
-      return { ok: false, reason: String((error && error.message) || error) };
+      return { ok: false, reason: String((error && error.message) || error),
+        ...(error?.code === 'ARTIFACT_SOURCE_CHANGED' ? { code: error.code } : {}) };
     }
   });
 

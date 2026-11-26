@@ -13,6 +13,7 @@ from ..services import im_adapters, im_connections as connections, im_ingress, r
 
 router = APIRouter(prefix="/api/v1/im", tags=["im"])
 from ..services.im_provider_registry import public as provider_catalog
+from ..timestamps import iso_utc
 
 
 async def raw_body(request):
@@ -114,7 +115,7 @@ async def messages(connection_id: str, client=Depends(current_client), session=D
     outgoing = list((await session.scalars(select(im.IMOutbox).where(im.IMOutbox.inbox_id.in_([row.id for row in rows])))).all())
     return {**connections.unpaired_observation(connection),
         "messages": [{"id": row.id, "taskId": row.task_id, "status": row.status, "detail": row.detail,
-        "createdAt": row.created_at.isoformat(), "outgoing": [{"status": item.status, "kind": item.kind,
+        "createdAt": iso_utc(row.created_at), "outgoing": [{"status": item.status, "kind": item.kind,
             "detail": item.detail} for item in outgoing if item.inbox_id == row.id]} for row in rows]}
 
 
@@ -136,8 +137,17 @@ async def dismiss(message_id: str, client=Depends(current_client), session=Depen
     return {"ok": True, "resent": False}
 
 
-@router.api_route("/webhooks/{connection_id}", methods=["GET", "POST"])
-async def webhook(connection_id: str, request: Request, session=Depends(get_session)):
+@router.get("/webhooks/{connection_id}", operation_id="im_webhook_get")
+async def webhook_get(connection_id: str, request: Request, session=Depends(get_session)):
+    return await _webhook(connection_id, request, session)
+
+
+@router.post("/webhooks/{connection_id}", operation_id="im_webhook_post")
+async def webhook_post(connection_id: str, request: Request, session=Depends(get_session)):
+    return await _webhook(connection_id, request, session)
+
+
+async def _webhook(connection_id: str, request: Request, session=Depends(get_session)):
     connections.enabled()
     connection = await session.get(im.IMConnection, connection_id)
     if not connection:
