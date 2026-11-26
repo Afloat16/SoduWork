@@ -21,12 +21,25 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
     const cwd = path.join(root, 'workspace'), agentDir = path.join(root, 'agent');
     fs.mkdirSync(cwd); fs.mkdirSync(agentDir);
     const resolutions = [], cleanups = [], executions = [], priorResults = [], requests = [], sessions = [];
+    const hubActions = [];
     const grants = new Set(), archives = new Map();
     let held = null, holdNext = false, revoked = false, generation = false, generated = 0, failNative = false, freezeWrites = false, htmlOnly = false;
     const server = http.createServer((request, response) => {
       let raw = '';
       request.on('data', chunk => { raw += chunk; });
       request.on('end', () => {
+        if (request.url.startsWith('/api/v1/tasks/permission-task')) {
+          const task = { id: 'permission-task', title: 'Permission change' };
+          let result = task;
+          if (request.url.endsWith('/attachments')) result = [];
+          if (request.url.endsWith('/conversation-turn')) {
+            hubActions.push(JSON.parse(raw).action);
+            result = { task, turn: { state: 'queued' } };
+          }
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify(result));
+          return;
+        }
         const body = JSON.parse(raw); requests.push(body);
         const user = body.messages.findLast(message => message.role === 'user');
         const prompt = JSON.stringify(user?.content || '');
@@ -173,6 +186,37 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
     assert.deepEqual(fresh.snapshot().activePlugins, []);
     assert.equal(resolutions.length, 3);
 
+    for (const [title, expectedAction] of [
+      ['a task without plugins completes after an in-place permission upgrade', 'complete'],
+      ['explicitly stopping an upgraded task still cancels it', 'cancel'],
+    ]) await t.test(title, async () => {
+      const rules = require('../main/access-control/policy');
+      const standard = rules.create('standard', cwd);
+      const handle = await open({ ref: 'permission-' + expectedAction, accessPolicy: standard });
+      const identity = { hub: new URL(fixtureModel.baseUrl).origin, clientId: 'fixture', secret: 'test-only' };
+      const firstAction = hubActions.length;
+      const task = await require('../main/pi-session/task-input').prepare(identity, 'permission-task',
+        handle.sessionId, 'turn-' + expectedAction, 'Finish the work.', {}, { handle });
+      holdNext = true;
+      const running = handle.submit(task.text, task.attachments, { taskId: task.task.id,
+        beforeTurn: task.beforeTurn, afterTurn: task.afterTurn });
+      await until(() => held !== null);
+      const release = held;
+      held = null;
+      let stopping;
+      try {
+        const upgrade = await handle.setAccessPolicy(rules.next('full', cwd, standard, standard.revision), standard.revision);
+        assert.equal(upgrade.ok, true, upgrade.reason);
+        assert.equal(upgrade.effective, 'current-turn');
+        if (expectedAction === 'cancel') stopping = handle.cancel({ userInitiated: true });
+      } finally {
+        release();
+      }
+      await stopping;
+      await running.completion;
+      assert.deepEqual(hubActions.slice(firstAction), ['prepare', 'start', expectedAction]);
+    });
+
     // Direct sends must enqueue raw intent; clearing or choosing a future
     // plugin cannot change the active turn or an earlier queued follow-up.
     holdNext = true;
@@ -261,5 +305,23 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
       assert.equal(grants.size, 0);
       assert.match(fs.readFileSync(path.join(cwd, 'report.html'), 'utf8'), /Business report/);
     }
+    // Real Pi requests must carry authoring intent even when the visible text
+    // only describes the future plugin's business behavior.
+    generation = false; executions.length = 0; priorResults.length = 0;
+    const featureAuthor = await open({ ref: 'feature-authoring' });
+    const latestUserText = () => {
+      const content = requests.at(-1).messages.findLast(message => message.role === 'user').content;
+      return typeof content === 'string' ? content : content.filter(item => item.type === 'text').map(item => item.text).join('\n');
+    };
+    const feature = '我给你区域范围、时间、人数和偏好，输出预算、路线和 HTML 旅行计划。';
+    for (const [text, options] of [[feature, { pluginIds: ['local:plugin-builder'] }], ['再支持随机推荐', {}]]) {
+      await send(featureAuthor, text, options);
+      assert.match(latestUserText(), /"authoring":\{"intent":"plugin-authoring"/);
+      assert.match(latestUserText(), /changing values.*plugin inputs/);
+      assert.equal(require('../main/pi-session/plugin-context').parse(latestUserText()).text, text);
+    }
+    await send(featureAuthor, '改为普通旅行讨论', { clearPluginSelection: true });
+    assert.doesNotMatch(latestUserText(), /"authoring":/);
+    assert.doesNotMatch(JSON.stringify(featureAuthor.snapshot().messages), /"authoring":|changing values/);
     await require('../main/app-resource-cache.cjs').close();
   });

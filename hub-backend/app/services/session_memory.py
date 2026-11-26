@@ -14,7 +14,9 @@ from sqlalchemy.exc import IntegrityError
 from .. import models
 from ..log_safety import redact_log_text
 from ..session_memory_models import SessionMemory
+from ..timestamps import iso_utc
 from . import inbox, task_access
+from .business_records import business_visible
 
 FIELD_LIMITS = {"summary": 6000, "goal": 3000, "decisions": 3000,
                 "constraints": 3000, "pending": 3000, "outcomes": 3000}
@@ -117,10 +119,10 @@ async def association(session, client, data):
 
 async def options(session, client, search=""):
     await owner(session, client)
-    projects = list((await session.execute((await project_query(session, client))
+    projects = list((await session.execute((await project_query(session, client)).where(business_visible(models.Project))
         .order_by(models.Project.name))).scalars())
     repos = list((await session.execute(select(models.Repo).where(
-        models.Repo.project_id.in_([p.id for p in projects])))).scalars()) if projects else []
+        business_visible(models.Repo), models.Repo.project_id.in_([p.id for p in projects])))).scalars()) if projects else []
     tasks = select(models.Task).where(task_access.visible_clause(client))
     if search:
         tasks = tasks.where(models.Task.title.contains(search, autoescape=True))
@@ -169,10 +171,10 @@ def view(row, detail=False):
     result = {"id": row.id, "title": row.title, "source": row.source,
               "sourceSessionId": row.source_session_id, "projectId": row.project_id,
               "repoId": row.repo_id, "taskId": row.task_id, "revision": row.revision,
-              "updatedAt": row.updated_at.isoformat(), "createdAt": row.created_at.isoformat(),
+              "updatedAt": iso_utc(row.updated_at), "createdAt": iso_utc(row.created_at),
               "visibility": "private", "scope": row.scope or "private", "archived": bool(row.archived),
               "sourceMeta": source_meta_view(row.source_meta),
-              "lastUsedAt": row.last_used_at.isoformat() if row.last_used_at else None,
+              "lastUsedAt": iso_utc(row.last_used_at) if row.last_used_at else None,
               "summary": row.fields.get("summary", "")[:250]}
     if detail:
         result.update(fields=row.fields, events=row.events, warnings=row.warnings)

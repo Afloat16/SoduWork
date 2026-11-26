@@ -9,6 +9,40 @@ FastAPI + SQLAlchemy(async) + PostgreSQL（本地开发可回退 SQLite）。
 
 模块职责与状态归属见[首版范围](../docs/release-scope.md)。
 
+首次对话清单根据可用模型目录和当前管理员最近一次桌面端报告显示进度。设备上报底座和模型选择是否就绪。五分钟内未收到新报告时，Hub 会将这两步显示为等待桌面端报告。
+
+## 任务办结回执
+
+有请求人的任务每次办结只保存一条回执。重试同一次办结会复用该回执。重新打开任务并再次办结会产生独立回执。实时通知采用至少一次投递语义。管理端回执列表默认每页 50 条，最多 200 条。
+
+通过 tasks API 新建或编辑任务时，允许标题 200 字符、请求人姓名 64 字符、联系方式 200 字符、请求人 ID 36 字符。字段超限时返回 HTTP 422 并指出字段名。如果已有任务超过这些限制，回执和通知用省略号标明缩短的标题或姓名，超长联系方式和 ID 会省略，以免将回复发给错误的收件人。可选的 `fieldWarnings` 对象会为受影响字段标记 `truncated` 或 `omitted`。办结响应在 `receiptFieldWarnings` 中返回相同提示，并保留任务原值。
+
+## 登记客户端安装包
+
+拥有 `client.update` 权限的管理员向 `POST /api/v1/admin/client-releases/upload`
+提交一个 multipart 文件 `installer` 即可。可选 `channel` 为 `stable` 或 `beta`；
+省略时优先使用环境配置 `SODUWORK_PUBLIC_DOWNLOAD_CHANNEL`，否则带 `-beta.N`
+的版本进入 beta，普通版本进入 stable。Hub 读取包内版本和主程序架构、核对文件名、
+计算原始文件哈希、签署更新清单并登记为停用状态。成功表示登记已完成。
+重复上传相同内容返回原记录并保留启停状态；同通道、版本、安装包名称的不同内容返回 409。
+每个包独立处理，不依赖 GitHub 集成，也不要求一次凑齐六个包。
+
+各发布环境一次性配置 `CLIENT_UPDATE_SIGNING_KEY_FILE` 和 `CLIENT_UPDATE_SIGNING_KEY_ID`。
+文件包含规范 Base64 编码的 32 字节 Ed25519 seed，由 Hub 账号读取；POSIX 权限为
+0400 或 0600，Windows 使用等效的受限 ACL。容器中以只读方式挂载，服务运行账号为
+UID/GID 10001。对应公钥须与 Hub 信任配置匹配，且已被已安装的客户端信任。
+不得在启动时生成新密钥，或将私钥放入镜像、源码、接口返回值及安装包。
+配置缺失、不可读或不受信任时，发布返回 503；既有下载继续可用。
+
+桌面包解析需要 PATH 上受维护的 `7zz` 或 `7z`，也可通过 `CLIENT_UPDATE_ARCHIVE_TOOL`
+指定可执行文件路径；APK 解析需要 PATH 上的 `aapt`。自托管镜像的 `deps` 阶段已包含两者。
+复用 `HUB_BASE_IMAGE` 时需重建包含这两个工具的依赖镜像，或使用 `HUB_BASE_IMAGE=deps`；
+运行镜像构建会拒绝缺少任一工具的基础镜像。
+EXE、DMG、ZIP、DEB、RPM、tar.gz 和 AppImage 解析不执行上传的代码；临时解包受时间、
+大小和嵌套层数限制。APK 从 Android manifest 读取元数据。请保留安装包原始文件名。
+可选 `bundle` 字段继续兼容离线签名上传，无需配置服务器签名；部署任务上传接口不变。
+选择 beta 通道不会改写包内版本：无 beta 后缀的包仅供手动安装，不作为自动升级目标。
+
 ## 快速开始（本地 SQLite，零配置）
 
 ```bash
@@ -22,7 +56,76 @@ python3 -m venv .venv
 
 打开 http://127.0.0.1:9080/docs 查看 API 文档，健康检查为 `GET /healthz`。
 
+### 升级本地附件存储
+
+停止所有能写入 uploads 卷的 Hub 进程，同时备份数据库和整个卷。早于 #336 的 Windows 部署应使用能保留 NTFS 命名流的备份。先用这组数据库与卷启动一个新版 Hub，确认成功后再启动其余写入进程。
+
+Hub 在接收请求前核对附件和会话交接包的本地引用，检查旧平铺名及两种旧哈希布局。归属唯一的文件移至 `uploads/objects-v2/<逻辑键原文按 UTF-8 计算的 SHA-256>`。数据库键和显示名保持原值。多条记录可以引用同一逻辑键。不同键共用一个物理文件、同一键有冲突来源，或活动记录缺少文件时，预检保留原件并报告。搬移中断后可重新启动继续。卷上写入迁移完成标记后，读写及删除只访问 v2。搬迁卷时应包含该标记。
+
+旧版 Hub 删除任务和归档后可能仍保留交接回执。如果归档已经删除，且没有活动记录引用它，启动可继续；归档还在时，迁移会保留文件。消息附件即使没有所属任务，也需要保留内容。
+
+如报告活动对象缺失，请根据逻辑键找到对应数据库记录及同一部署的可信备份。早期 Windows 部署的内容可能保存在 NTFS 命名流中。确认归属，将恢复出的普通文件与已有长度和 SHA-256 记录核对。保持 Hub 停机，把已核实的副本放入恢复卷上该逻辑键对应的 v2 路径，并保留原备份。归属或内容无法核实的原件应留待人工核查。启动成功后，通过下载核对原始字节。回滚时先停机，同时恢复旧数据库和 uploads 卷，再启动旧版本。
+
+### 自动化只读查询
+
+脚本应连接配置中的 Hub 地址。以下本地开发示例使用 9080 端口。健康检查允许匿名访问。查询账号可见的项目时，通过 `POST /api/v1/admin/login` 获取该账号的访问令牌，由环境变量或 CI 密钥存储提供 `HUB_TOKEN`。账号需要 `task.view` 权限。
+
+```sh
+HUB_URL=http://127.0.0.1:9080
+curl --fail --silent --show-error "$HUB_URL/healthz"
+curl --fail --silent --show-error -H "Authorization: Bearer $HUB_TOKEN" "$HUB_URL/api/v1/admin/projects"
+```
+
+项目响应是 JSON 数组。空数组表示该账号没有可见项目。HTTP 401 表示令牌缺失、无效或已过期，HTTP 403 表示已登录账号缺少所需权限。
+
+## 排查派活排队
+
+Runner 首次接收派活时会在日志中记录执行引用和队列位置。任务排队期间，
+`GET /api/v1/tasks/{tid}/ai-status` 可返回 `runner.waitReason`。
+`resource_pressure` 表示资源准入策略暂停启动新任务。
+`execution_slot` 表示这项工作可用的执行槽已被占用。
+内存使用率达到 92%，或上报的可用内存低于 768 MiB 时，Runner 会暂停启动新任务。
+在上报的内存充足时，如果 CPU 使用率连续至少一秒保持在 95% 或以上，Runner 允许一次执行一个任务。
+采样值低于 95% 后重新计时。CPU 持续高压期间，内存保护仍然优先。
+该字段为可选项。再次查询同一任务即可看到当前等待原因或已开始执行的状态。
+
+对于直接派活，Hub 根据执行引用和准入键向原 Runner 核对持久化回执。匹配的回执或任务专属心跳会续约 90 秒，
+包括因内存压力持续排队的情况。失去确认后，租约检查会返回 `queueLeaseStatus=unconfirmed` 和
+`queueLeaseReason=no_runner_ack`。设备端 ai-status 在 `runner` 下返回这两个字段，管理端在顶层返回。
+Runner 重连会触发持久化队列核对。等待确认期间应保留原派活，以免同一任务重复执行。
+
+队列因资源压力暂停时，Runner 会定期记录 CPU 使用率、可用内存和队列深度。第二个进程尝试打开同一队列时，
+会退出并报告上次登记的持有者 PID 和 Runner 启动标识。
+
+## 桌面本地 Runner 事件恢复
+
+桌面本地 Runner 执行会将事件去向与会话别名分别持久化。本地历史不会进入 Hub
+任务回传通道，Hub outbox 阻塞也不会阻止本地执行；CPU、内存和执行并发限制仍然生效。
+桌面排队中的轮次显示排队文案，不再显示模型处理中的文案。
+
+升级后，Runner 仅在旧聊天的别名、底座与确定性执行引用一致时确认其本地归属。
+恢复时会持久化已确认的本地路由归属；无法确认的记录保留原有路由元数据。
+确认属于本地的事件包会先写入私有 `local-events-*.archive` 恢复文件，再从活跃
+outbox 移除；Windows 载荷保留 DPAPI 保护，采集标记保持不变。归属不明的事件流及
+真实 Hub 事件均保持原状，NACK 不会被当成 ACK。恢复文件总量限制为配置的 outbox
+字节预算的三倍，包含编码开销。归档失败时保留原事件并输出诊断；无关 Hub 事件的
+投递与采集仍可继续，但受实际 outbox 容量限制。恢复文件应保持私有，在完成核查前保留。
+运行 `python3 -m unittest test_runner_event_scope test_runner_event_delivery` 可验证
+归属路由、重启恢复、归档写入中断和 Hub 事件保留。
+
 ## 受管 Pi 执行
+
+底座发现会检查有界的 npm 前缀、Homebrew 和 nvm 路径，包括未出现在桌面进程继承 PATH 中的安装。所选可执行文件的版本、Node 引擎要求和 DeepSeek 适配器元数据必须来自同一份安装，不能借用无关私有目录中的包信息。Windows Codex 发现会跳过被排除的 WindowsApps 候选并继续搜索。显式底座覆盖、托管运行时归属和原生依赖检查仍生效。只安装 DeepSeek 桌面应用不代表已安装 Runner 所需的 ACP 适配器。
+
+已识别的 npm JavaScript 底座在版本探测和正式执行时使用同一个经过校验的 Node 与包入口，启动脚本旁的 Node 不再覆盖该选择。Node 候选需满足所选包及宿主的最低版本；DeepSeek 启动预检及缓存也跟踪所选 Node 和入口。原生可执行文件及自定义 wrapper 保留显式命令。
+
+DeepSeek 原生包按所选 Node 的平台、架构和 Linux libc 校验，覆盖 Rosetta 与混合运行时安装；无法确认 Node 身份时拒绝启动。正式启动和版本探测的子进程继承所选 Node 目录，不修改 Runner 全局 PATH；Windows 带引号的 PATH 项仍保持原有优先级。
+
+模型能力报告 v3 验证合成工具结果后的流式续答，保留工具且不追加用户消息。已有 v2 工具成功结论需要重新检测，独立证据仍保留；请部署配套桌面更新。模型拒绝错误在 JSON、SSE 和传输日志中共享不透明的 `soduwork-trace` 编号；经过校验的上游请求编号仅用于关联，不参与错误分类。一般 403 的提示不再仅凭状态推断密钥权限。
+
+读取旧模型配置时，个别字段不兼容不会清除其他有效的手工能力声明，读取过程不会回写数据库。保存仍校验配置字段，并拒绝数组、字符串等非对象值；显式传入 `config: null` 保留原有重置行为。读取或升级不会把未确认能力提升为支持，未能确认的能力检测也不会替换手工声明。
+
+模型传输拒绝日志区分已识别的限流、计费错误和未分类的 429，不记录供应商响应正文。数字及 HTTP 日期格式的 `Retry-After` 通过既有 JSON/SSE 错误协议传递；超过一天的等待按一天传递，已超出桌面重试预算。计费错误不附带重试等待提示。Hub 不增加重试循环；配套桌面更新仅在既有单轮预算内遵守供应商等待时间。
 
 受管 Pi 执行为每条 Runner 执行记录绑定独立的配置与会话目录，目录位于 Runner 数据根目录下。启动及后续轮次使用同一个明确路径，不依赖继承的桌面 Pi 设置或操作系统主目录解析。模型文件只保存凭据的环境变量引用；模型配置缺失或文件发布失败时，会在 Pi 启动前停止执行。个人 Pi 与桌面本地模型配置保持不变。升级时，只允许将 Runner 记录中明确标识且工作目录匹配的原生会话复制到私有目录，原文件保持不变。已有执行历史的后续轮次必须找到原生会话，不会静默新建会话。
 
@@ -30,7 +133,25 @@ Runner 重启后，恢复终端仍绑定原执行的会话历史，不恢复模�
 
 安装客户端依赖后，可在后端测试环境运行 `python3 e2e_pi_dispatch_config.py --output /absolute/evidence/directory`，通过隔离鉴权 Hub、真实 Runner 和 Pi 子进程及本机回环模型验证派发、后续轮次、文件产物、重启后的原生终端恢复与个人模型配置保护。该验证不覆盖生产模型或原生桌面界面。
 
+## Runner 多会话并发
+
+桌面私有通道与 Hub RPC 分别为工作、读取、底座检测和控制保留有上限的处理能力。慢检测或历史读取不会占用停止其他会话所需的工作线程。同一执行引用的变更操作在两个通道间保持顺序；停止会使更早收到、但尚未进入持久化准入的请求失效。因通道容量拒绝的请求会明确标为未接收，可以使用原业务编号重试。这不改变账号授权、本地模型隐私或根据 CPU、内存调整的执行并发预算。
+
+创建进程时不持有会话全局锁。取消操作保留本次启动的准确归属，直到确认进程树清理完成；未确认退出不会释放该执行名额或允许替代执行。事件保存失败会保留尚未保存的批次，成功重试后才恢复 Hub 执行准入；当前快照为空或其他事件收到确认，都不能丢弃该批次。桌面本地执行的准入仍独立于 Hub 事件保存状态。
+
+模型元数据从快照采集到远程投影始终携带当时的隐私分类。在读取期间切换到 Hub 模型，不会使旧本地模型标识或 token 统计被上传。附件读取和补充消息的后台线程也会保留取消归属，直到实际操作结束。
+
+在后端测试环境运行 `python3 -m unittest test_runner_local_rpc test_runner_remote_rpc test_runner_event_delivery test_runner_usage_receipts test_runner_input_cleanup test_local_process_cleanup test_task_goal_stop_races`。私有管道测试使用真实 Runner 进程和持久队列，底座检测为模拟；进程清理测试使用隔离的操作系统子进程。在其他平台运行这些检查，不代表已完成真实模型或 Windows 验收。
+
+## 插件治理统计口径
+
+`GET /api/v1/admin/plugins/governance` 的 `summary.pendingReview` 和 `summary.attention` 分别统计当前用户可见的待审核插件数和需要处理的插件数。同一插件只计一次。即使新版本已经批准，只要旧版本仍在隔离区，该插件仍计入待审核。
+
+`counts.review` 和 `summary.pendingReviewVersions` 统计待审核版本数。`summary.attentionItems` 是各类待办事项数之和。`pluginCounts` 按插件给出待审核版本数（`review`）和待办事项数（`attention`）。接口先统计，再为每类队列返回最多 30 条预览。每条审核待办保留独立的 `versionId`。评测事项的统计范围仍为最近 1,000 条评测，运行事项的统计范围仍为近 30 天内最近 500 次运行。
+
 ## 质量门禁
+
+本机需求准备阶段将 `executionSubmissionChoice` 与实际的 `executionSubmissionMode` 分开保存。选择自动判断时，本轮完成且校验通过的正式成果会触发自动提交验收；明确手动及来源不明的历史手动值保持原行为。验收仍由需求创建人执行。本轮交付问题会显示采集中断、成果无效或创建人不可用，不改变审批权限。新的策略确认和问题回执需要桌面与 Hub 一起更新。
 
 所有后端冒烟都登记在 `quality_manifest.py`，新增脚本未登记会直接阻断发布：
 
@@ -50,6 +171,10 @@ python3 quality_gate.py --list
 
 `live` 层可能连接真实 Hub、Runner、代码平台、模型或业务库，默认拒绝执行，不能用来替代离线发布门禁。详细口径见 [`../docs/release-scope.md`](../docs/release-scope.md)。
 
+人工提交验收将验收请求与通知任务放在同一事务中提交。HTTP 回执不等待设备通知发送，避免慢连接让已经成功提交的需求仍显示为可重试。现有通知工作进程会重试发送失败，并按接收人当前权限重新生成通知内容。运行 `py -m unittest test_local_requirement_delivery` 可验证回执、幂等与事务回滚。
+
+在 `client/` 目录运行 `node e2e/run-requirements-isolated.cjs /绝对路径/证据目录 /测试环境/python路径 requirements-manual-submit-race`，可通过隔离 Electron 与 HTTP 验证生产客户端超时和合成慢通知接收端的组合。测试使用独立数据库和文件，不使用真实账号，也不发送外部消息。
+
 离线检查拥有各自的子进程树，并在清理完成后返回，包括命令先于后代进程退出的情况。在 Windows 上，门禁复用仓库中的 Windows PowerShell Job 辅助程序，确认 Job 分配成功后才允许命令执行。输出采集到私有临时文件，避免后代继承输出句柄导致超时后无限等待；失败报告保留超时前产生的输出。运行 `py -m unittest test_quality_gate_cleanup` 可验证当前平台上的真实进程清理回归。
 
 受权限控制的回合在结算或开始下一轮前，必须确认执行宿主已退出。已有可靠的 Agent 退出记录时，正常收尾最多等待 30 秒，例如冻结程序清理自己的解压目录；取消和权限变更仍使用较短的停止期限。终止无法确认时继续跟踪原进程并阻止替换，不能仅凭已有回答或终止请求成功就判定完成。可运行 `python3 -m unittest test_local_process_cleanup`，使用隔离子进程验证延迟退出与终止未确认的行为。
@@ -67,6 +192,32 @@ DeepSeek ACP 适配器 0.4.40 和 0.4.41 可能在子代理仍运行时返回完
 收到 `max_tokens` 时，经过核对的适配器只把原生状态为 pending 的工具预览标记为未执行，再清理预览。DSH 在执行前就会丢弃这些调用；真正开始执行的工具仍须等待实际结果。宿主在实时和历史工具卡片中保留这个区别，后续真实失败也不会被旧取消状态掩盖。
 
 工具活动结束后，DeepSeek Harness 可在原会话中从已保存的结果接着做，并使用更小的工具调用。自动恢复最多续跑一次，只有原生压缩成功后才能再续跑一次。持续达到上限时，会显示本轮未完成并保留进度，不再作为协议错误呈现。续跑成功会清除旧截断状态；协议错误和宿主清理失败仍优先处理。
+
+使用托管模型路由时，SoduWork 显式启用 DeepSeek 原生自动压缩并配置预算，
+在当前回合的工具步骤之间执行。
+触发阈值取模型上下文窗口的 80% 与扣除当前输出、摘要预算后剩余空间的较小值。
+摘要输出不超过模型配置的输出上限，不再沿用原生的 65,536 token 预留。
+正常输出上限保持不变；只有几乎占满上下文窗口的输出上限才会下调，为输入留出空间。
+原生压缩保留当前会话、工具结果、权限与取消归属，无需用户再次发送消息。
+这不会把模型单次输出上限误判为上下文溢出，也不会移除上述有界续跑限制。
+
+运行 `python3 -m unittest test_dsh_gateway test_context_recovery
+test_acp_error_messages test_local_turn_outcome` 可验证模型预算与恢复回归。
+配置或推断的上下文大小仍需符合实际服务限制；如果窗口连原生指令和工具定义都容纳不下，
+仅靠压缩无法解决。
+
+真实原生进程验证可运行 `python3 e2e_dsh_auto_compaction.py`，使用上述生命周期验证相同的
+`--adapter-entry`、`--runtime-root`、`--node` 和 `--output` 明确路径参数。
+合成本机模型服务使 64k 窗口在一条用户需求内反复压缩；测试与旧的仅配置模型路由的 bundle
+对照，检查持久检查点和已完成工具，并要求压缩后的原生用量回执下降。
+这不替代生产模型或桌面界面验收。
+
+托管 Kimi 和 Qwen 同样接收所选模型的上下文窗口，不再沿用更大的原生默认值。
+Kimi 接收明确配置的输出上限；Qwen 保留管理员的采样与输出参数。
+二者均使用各自原生的步骤间压缩。托管 Codex Harness 接收模型窗口和 80% 的自动压缩阈值。
+个人账号版 Codex 保留原生模型设置；OpenCode 已传入上下文与输出限制，并保留原生自动压缩。
+运行 `python3 -m unittest test_kimi_runtime test_qwen_runtime test_acp_permission_inputs
+test_codex_account_acp` 可验证这些配置与隔离边界。
 
 DeepSeek 运行时预检按归档锁定版本检查 Windows、macOS 和 Linux 的 x64/arm64
 sharp、koffi 和 ripgrep 包；macOS/Linux 还检查 libvips，Linux 区分 glibc 与 musl
@@ -158,9 +309,9 @@ OpenCode 原生和 ACP 执行均保留当前回合的模型停止原因。达到
 
 ## OpenCode 安装与网络诊断
 
-Runner 归档下载、模型网关连通性预检与 macOS Runner 的安全控制连接共用严格的 TLS 信任配置。默认保留 Python/OpenSSL 的系统根证书，同时加载随包提供的 `certifi` 公共 CA 文件，避免冻结可执行文件依赖用户机器上不存在的构建时 OpenSSL 证书路径。证书链与主机名仍须通过校验。这不改变外部原生底座自身的 HTTPS 配置。
+macOS、Windows 和 Linux 上的 Runner 归档下载、模型网关连通性预检与安全控制连接共用一套 TLS 配置。默认通过 MIT 许可的 `truststore` 使用安装机的系统信任：macOS 使用 Security framework，Windows 使用 CryptoAPI，Linux 通过 OpenSSL 使用系统 CA 存储。不追加随包提供的公共 CA 文件。原生验证能力缺失或证书被拒绝时直接失败，不换另一套信任策略重试。证书链与主机名仍须通过校验。这不改变外部原生底座自身的 HTTPS 配置。
 
-非空的 `SSL_CERT_FILE` 或 `SSL_CERT_DIR` 会明确替换上述默认信任范围；路径缺失或无效时直接失败，不回退到公共根证书。配置私有 CA 时应提供完整的所需信任集合。空值不会启用独占的显式信任覆盖，默认路径发现仍遵循 Python/OpenSSL 的环境变量语义。仅在 HTTPS 请求时加载证书，包括从 HTTP 跳转到 HTTPS；普通 HTTP 不依赖证书配置。现有下载代理选择和模型网关直连策略保持不变。
+非空的 `SSL_CERT_FILE` 或 `SSL_CERT_DIR` 会用指定的 CA 文件或 OpenSSL 哈希 CA 目录明确替换默认系统信任。路径缺失或无效时直接失败，不回退到系统或随包根证书。配置此覆盖时应提供完整的所需信任集合。空值使用默认系统信任。HTTP 客户端仅在 HTTPS 请求时加载证书，包括从 HTTP 跳转到 HTTPS；普通 HTTP 不依赖证书配置。现有下载代理选择和模型网关直连策略保持不变。
 
 受管安装器依次尝试明确配置的镜像、当前连接的 Hub 和官方发行源。macOS 上通过 Python 安装器下载归档时，每次尝试都会按协议合并系统 HTTP/HTTPS 代理与环境变量覆盖值。明确设为空的代理变量会禁用对应协议的系统代理。来自系统的代理同时保留系统绕过规则和 `NO_PROXY`；空 `NO_PROXY` 不会取消系统例外。显式代理覆盖仍采用标准环境绕过行为，当前 Hub 的精确来源（协议、主机、端口）保持直连。TLS 证书校验和固定 SHA-256 校验始终启用。这些下载规则不改变 npm 依赖安装或模型网关的连接策略。
 
@@ -180,25 +331,46 @@ python3 fetch_opencode_assets.py darwin-arm64 darwin-x64 darwin-x64-baseline
 python3 e2e_runner_tls.py --output /absolute/evidence/directory
 ```
 
-检查覆盖随包 CA 资源、默认根证书缺失、显式信任覆盖，以及拒绝不可信证书和主机名不匹配的证书。`--source-only` 可不打包执行同一调用路径。这些测试不能替代完整桌面、生产模型或其他操作系统验证。
+检查覆盖随包原生验证模块、使用临时信任锚的真实 TLS 握手、显式信任覆盖，以及拒绝不可信证书和主机名不匹配的证书；不修改机器的证书信任存储。`--source-only` 可不打包执行同一调用路径。这些测试不能替代完整桌面、生产模型或其他操作系统验证。
 
 ## API 概览
 
-- 客户端契约（设备登记 → 管理员激活 → 短期 `Device` 会话；长期设备密钥在 Hub 只存摘要）
+AI 代理的图片和视频生成接口按媒体类型接收创作参数，例如图片尺寸或视频时长。模型配置的 `defaults` 优先于请求参数。供应商专用参数可以在模型目录的 `defaults` 中设置。代理会忽略未识别的请求字段。
+
+通过 `POST /api/v1/usage/events` 上报用量时，省略 `occurredAt` 表示使用 Hub 收到事件的时间。上报历史事件时可填写 ISO 8601 时间戳。没有时区偏移的时间戳按 UTC 解释。如果任一事件的时间戳无效，Hub 返回 HTTP 422，整批事件均不入账。 例如，不带偏移量的 16:30 对应北京时间次日 00:30。若要上报北京时间 16:30，请带上 `+08:00`。
+
+省略 `sourceType` 时使用 `chat`。允许的类型为 `chat`、`task`、`workflow`、`automation` 和 `system`，使用所列的小写拼写。任务和工作流上报须关联本设备拥有或当前账号获派的任务。无效类型返回 HTTP 422。每条回执均包含已入账的累计计数，以及 `created`（新建）、`updated`（计数增长）或 `duplicate`（计数没有增长）状态。
+
+聊天用量的 `sourceId` 和 `conversationId` 均表示本地会话 ID，可任选其一，同时提供时两者必须一致。同一回执在重试时保留首次上报的会话，归属冲突时整批返回 HTTP 422。仅提供幂等键也可以累计用量。Hub 按账号、设备和本地会话核对会话目录，匹配后，回执和用量明细返回会话 ID 及 `sourceVerification: "verified"`。尚未匹配时返回空 ID 和 `"unverified"`。如果会话晚于用量同步，下次查询即可看到核验结果。
+
+- 客户端契约（员工登录或管理员配对 → 短期 `Device` 会话，Hub 只保存设备密钥摘要）
   - `GET/POST /api/v1/tasks`、`GET/PATCH/DELETE /api/v1/tasks/{id}`
   - `POST /api/v1/tasks/batch-update`、`POST /api/v1/tasks/clear-done`（只清 done）
   - `POST /api/v1/tasks/{id}/agent/{run|retry|takeover}`
-  - `GET/PUT /api/v1/config`
+  - `GET /api/v1/config?withRevision=true` 返回当前设备设置、可写字段 `_configKeys` 和版本 `_configRevision`。向 `PUT /api/v1/config` 提交改动字段及读取时的版本。未知字段或无效值返回 422，版本过期返回 409，覆盖已有值但缺少版本返回 428。
   - `POST /api/v1/clients/enroll`（登记/心跳，激活后签发短期会话）
   - `WS /api/v1/ws?device=<设备ID>&session=<短期会话>`（实时推送）
 - 管理端
-  - `POST /api/v1/admin/login` `{user,pass}` → 短期登录 token
+  - `POST /api/v1/admin/login` `{user,pass}` → 短期登录 token。五分钟内同一账号登录失败 10 次或同一 IP 失败 30 次后，Hub 返回 HTTP 429，响应头 `Retry-After` 表示还需等待的秒数。多个 Hub 进程通过数据库共享计数，失败记录可在审计日志中按 `admin.login.failed` 查询。
   - `GET /api/v1/admin/clients`、`GET /api/v1/admin/tasks`（需 `Authorization: Bearer <token>`）
   - `POST /api/v1/admin/dispatch` `{title,...,targets:[设备ID]}` → 平台建任务下发（origin=dispatch）
 
+### 列表分页
+
+在 `/api/v1` 下，`admin/users`、`admin/orgs`、`admin/roles`、`admin/domains`、`tasks` 和 `schedules` 在省略分页参数时保留原有数组。传入 `limit`（1–200）或 `offset`（从 0 开始）即可获取 `{items, total}`。只传偏移量时每页默认 50 条。总数按当前身份可见的记录计算，偏移量超过末尾会返回空页。
+
+`GET /api/v1/admin/ai-schedules/{sid}/runs` 默认返回最近 20 条运行记录。整数参数 `limit` 可取 1 至 200，越界返回 HTTP 422。
+
+需要固定响应结构时，使用 `GET /api/v1/admin/client-inventory`。每次响应都包含 `items`、`total`、`counts`、`page`、`pageSize` 和 `offset`。可使用 `page` 和 `pageSize`（1–100，默认 25），或使用 `offset` 和 `limit`。旧的 `admin/clients` 调用仍可获取原有数组，也可通过 `paged=1` 获取对象。
+
+资料库同样支持可选的条数和偏移量，先排列文件夹，再排列文件。返回体保留独立的 `folders` 和 `items` 数组，分页时提供两者合计的 `total`。审批和交付列表接受正整数条数和从 0 开始的偏移量。
+
 ## 客户端接入
 
-设备长期密钥只由 Electron 主进程持有。客户端通过 `POST /api/v1/clients/enroll` 登记并轮换短期会话，
+新安装可先连接 Hub。员工成功登录或管理员配对后，Hub 才保存设备 ID 和密钥摘要。旧版客户端在兼容模式下可继续使用已登记的密钥，新安装的旧版客户端需升级到当前桌面版。
+员工可在登录页或账号安全页复制设备配对码，直接交给管理员。管理员在设备列表选择“配对设备”，选定员工，并在十分钟内粘贴配对码。配对完成后，员工可在桌面端点击“重试连接”。激活待登记设备或变更归属时也需要新的配对码。已停用设备须先重新登记，再获取配对码。
+
+设备长期密钥只由 Electron 主进程持有。已绑定设备通过 `POST /api/v1/clients/enroll` 轮换短期会话，
 业务请求使用 `Authorization: Device <session>`，WebSocket 使用同一短期会话；长期密钥不得进入渲染进程、日志或 URL。
 任务与流程状态以 Hub 为唯一事实源，本地缓存只用于断网展示和待同步命令，不能反向覆盖服务端新状态。
 
@@ -275,3 +447,7 @@ python3 e2e_dsh_private_probe.py \
 ```
 
 此显式检查使用生产私有探测作业和 ACP 桥接、实际安装的适配器与运行时，以及合成本机回环模型。先重现旧安装路径错误，再要求修正路径后出现真实模型请求并由 Agent 返回预期响应。检查使用可清理的用户目录、状态和临时目录，阻止 Node 连接非回环地址，并清理自身子进程；不会安装或更新依赖，也不使用真实凭据，不覆盖桌面界面、生产 Hub 或模型服务行为。由于需要已有原生安装，请在离线质量门禁之外单独运行。
+
+## 删除模型服务
+
+持有 `integration.manage` 权限时，通过 `GET /api/v1/admin/model-providers/{id}/deletion-impact` 获取服务版本、影响清单版本、子模型及可见的已保存模型选择。成员名称需要 `user.manage`，需求标题需要 `task.view`，两者均遵守部门可见范围。调用已有的 `DELETE /api/v1/admin/model-providers/{id}` 时，以 `expectedRevision`、`expectedImpact` 传入预览返回的版本，另以 `confirmId` 传入完整服务 ID。旧版请求未预览会返回 HTTP 428。遇到 HTTP 409 时，应重新获取清单并再次确认。内置服务禁止删除。

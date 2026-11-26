@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing, contextmanager
+import errno
 import getpass
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import socket
@@ -20,7 +22,8 @@ from urllib.request import ProxyHandler, build_opener
 import webbrowser
 
 from .local_environment import (ROOT, StartupError, check_dependencies, check_desktop_session, dependency_report,
-                                prepare, prepare_desktop, spawn_options, stop_child, wait_child)
+                                prepare, prepare_desktop, source_copy_targets, spawn_options, stop_child, wait_child)
+from .local_path_check import check_windows_source_paths
 
 
 STATE_VERSION = 1
@@ -79,7 +82,6 @@ def secure_directory(state: Path) -> None:
         result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"],
                                 capture_output=True, check=True,
                                 **spawn_options())
-        import re
         match = re.search(rb"S-\d+(?:-\d+)+", result.stdout)
         if not match:
             raise StartupError("Could not determine your Windows account for private data permissions.")
@@ -114,6 +116,10 @@ def initialize(state: Path, username: str) -> dict:
     return config
 
 
+class DataDirectoryInUse(StartupError):
+    """Another source launcher holds the OS lock for this state directory."""
+
+
 @contextmanager
 def exclusive(state: Path):
     """OS-held lock is released on Ctrl+C, errors, or a killed launcher."""
@@ -127,16 +133,16 @@ def exclusive(state: Path):
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
-            try:
+        try:
+            if os.name == "nt":
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise StartupError("This SoduWork data directory is already running. Use its existing window.") from exc
-        else:
-            import fcntl
-            try:
+            else:
+                import fcntl
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise StartupError("This SoduWork data directory is already running. Use its existing window.") from exc
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise
+            raise DataDirectoryInUse("Another SoduWork launcher is using this data directory.") from exc
         locked = True
         yield
     finally:
@@ -158,8 +164,11 @@ def initialized(state: Path) -> bool:
     try:
         with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as conn:
             return bool(conn.execute("SELECT COUNT(*) FROM app_user").fetchone()[0])
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
+    except sqlite3.DatabaseError as exc:
+        # OperationalError ("no such table") is a subclass of DatabaseError, so this
+        # also covers a damaged/non-SQLite file, which raises DatabaseError directly
+        # (for example "file is not a database") instead of an OperationalError.
+        if isinstance(exc, sqlite3.OperationalError) and "no such table" in str(exc):
             return False
         raise StartupError("Cannot inspect the local database. See the data directory; no data was reset.") from exc
 
@@ -171,7 +180,7 @@ def password_for_start(state: Path, config: dict, stdin: bool) -> str:
     print(f"首次创建管理员 / Create the administrator account: {config['adminUser']}", flush=True)
     if stdin:
         password = sys.stdin.readline().rstrip("\r\n")
-    elif sys.stdin.isatty():
+    else:
         print("请设置并记住自己的密码；输入时不显示字符或星号，输入后按回车。\n"
               "Choose and remember your own password. Typing is hidden; press Enter when done.", flush=True)
         while True:
@@ -182,9 +191,6 @@ def password_for_start(state: Path, config: dict, stdin: bool) -> str:
             if password == getpass.getpass("再输一次 / Confirm password: "):
                 break
             print("两次密码不一致，请重试 / Passwords did not match; please try again.", flush=True)
-    else:
-        raise StartupError("Run from an interactive terminal to choose the administrator password. "
-                           "Automation may explicitly pass --password-stdin.")
     if not 12 <= len(password) <= 128 or password.isspace():
         raise StartupError("Choose an administrator password of 12-128 characters. No default password is provided.")
     return password
@@ -202,8 +208,11 @@ def assert_available(host: str, port: int) -> None:
         try:
             probe.bind((host, port))
         except OSError as exc:
-            raise StartupError(f"Port {port} is already in use. Existing services were left running. "
-                               "Choose another port with --port.") from exc
+            if exc.errno == errno.EADDRINUSE or getattr(exc, 'winerror', None) == 10048:
+                raise StartupError(f"Port {port} is already in use. Existing services were left running. "
+                                   "Choose another port with --port.") from exc
+            raise StartupError(f"Cannot bind to {host}:{port}: {exc}. "
+                               "Check --host and your network configuration.") from exc
 
 
 def runtime_environment(state: Path, config: dict, password: str, host: str, port: int) -> dict:
@@ -277,10 +286,13 @@ def open_management_page(base: str) -> None:
 def serve(state: Path, config: dict, args) -> None:
     assert_available(args.host, args.port)
     initializing = not initialized(state)
-    password = password_for_start(state, config, args.password_stdin)
+    if initializing and not args.password_stdin and not sys.stdin.isatty():
+        raise StartupError("Run from an interactive terminal to choose the administrator password. "
+                           "Automation may explicitly pass --password-stdin.")
     log = state / "startup.log"
     python, backend = prepare(state, log)
     client = prepare_desktop(state, log) if args.desktop else None
+    password = password_for_start(state, config, args.password_stdin)
     env = runtime_environment(state, config, password, args.host, args.port)
     base = env["HUB_PUBLIC_URL"]
     print("正在启动服务并准备数据库 / Starting SoduWork and applying database migrations...", flush=True)
@@ -382,6 +394,31 @@ def desktop_profile(state: Path) -> Path:
     return profile
 
 
+def request_workspace_activation(state: Path) -> bool:
+    """Ask only the running desktop for this profile to show its workspace."""
+    try:
+        endpoint = desktop_profile(state) / "source-workspace-activation.json"
+        with endpoint.open("rb") as stream:
+            raw = stream.read(513)
+        if len(raw) > 512:
+            return False
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            return False
+        port, token = record.get("port"), record.get("token")
+        if type(port) is not int or not 1 <= port <= 65535:
+            return False
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+            return False
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(2)
+            client.connect(("127.0.0.1", port))
+            client.send(b"open-workspace " + token.encode("ascii"))
+            return client.recv(32) == b"opened"
+    except (StartupError, OSError, ValueError):
+        return False
+
+
 def launch_desktop(state: Path, client: Path, env: dict, base: str, output) -> subprocess.Popen:
     """The source session owns a separate profile and never rewrites an installed client."""
     profile = desktop_profile(state)
@@ -395,6 +432,9 @@ def launch_desktop(state: Path, client: Path, env: dict, base: str, output) -> s
             json.dump({'workDir': str(work)}, stream)
     desktop_env = {key: value for key, value in env.items()
                    if key not in {'ADMIN_USER', 'ADMIN_PASS', 'AUTH_SECRET', 'DATABASE_URL'}}
+    # Explicit diagnostic output is desktop-only; do not broaden the Hub environment allowlist.
+    if os.environ.get('SODUWORK_REQUIREMENT_DIAGNOSTICS_DIR'):
+        desktop_env['SODUWORK_REQUIREMENT_DIAGNOSTICS_DIR'] = os.environ['SODUWORK_REQUIREMENT_DIAGNOSTICS_DIR']
     if sys.platform == 'darwin':
         # macOS resolves the user's default Keychain through HOME. Isolate the
         # application profile, not the native desktop's operating-system home.
@@ -445,6 +485,12 @@ def wait_session(server: subprocess.Popen, desktop: subprocess.Popen, state: Pat
 
 
 def main(argv=None) -> int:
+    if sys.platform == "win32":
+        # Redirected Windows output can use a legacy code page. Keep its encoding
+        # while ensuring bilingual diagnostics and Unicode paths cannot abort startup.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=default_state(), help="New empty directory, or this launcher's existing directory")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP port (default: 18989)")
@@ -472,6 +518,7 @@ def main(argv=None) -> int:
         if args.check:
             profile = desktop_profile(args.data_dir.expanduser().resolve()) if args.desktop else None
             dependency_report(desktop=args.desktop)
+            check_windows_source_paths(args.data_dir.expanduser(), source_copy_targets(), probe=False)
             if profile is not None:
                 print(f'Desktop profile: {profile}')
             return 0
@@ -493,6 +540,22 @@ def main(argv=None) -> int:
                 return 0
             serve(state, config, args)
         return 0
+    except DataDirectoryInUse as exc:
+        if args.desktop and not args.prepare_only:
+            if request_workspace_activation(state):
+                print("已唤起现有桌面工作区 / Reopened the existing desktop workspace.", flush=True)
+                return 0
+            print("桌面端未确认打开工作区。如果首次启动仍在进行，请等待原启动终端完成后再试。"
+                  "若桌面端已就绪，请点击托盘图标。如需重启，请在原启动终端按 Ctrl+C，"
+                  "等待服务停止后，再用相同数据目录运行带 --desktop 的启动命令。\n"
+                  "The desktop did not confirm opening the workspace. If startup is still in progress, "
+                  "wait for it to finish in the original terminal and try again. If the desktop is ready, "
+                  "click its tray icon. To restart, "
+                  "press Ctrl+C in the original terminal, wait for shutdown, then run the launcher "
+                  "with --desktop and the same data directory.", file=sys.stderr)
+        else:
+            print(str(exc), file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("\nSoduWork stopped. Your data is retained.")
         return 0

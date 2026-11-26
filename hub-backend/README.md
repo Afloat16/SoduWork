@@ -6,6 +6,46 @@ Command examples use `sh start.sh` on macOS/Linux. On Windows, use `.\start.cmd`
 
 Hub provides identity, authorization, execution governance, plugins, shared materials, and desktop connectivity. It uses FastAPI and asynchronous SQLAlchemy with PostgreSQL; local development can use SQLite.
 
+The first-chat checklist combines the available model catalog with the signed-in administrator’s latest desktop report. The device sends two readiness flags for its runtime and model selection. After five minutes without a fresh report, the Hub shows those steps as awaiting the desktop.
+
+## Task completion receipts
+
+A completion with a requester produces one stored receipt. Retrying that completion reuses the receipt. Reopening the task and completing it again produces a separate receipt. Live notifications use at-least-once delivery. The admin receipts list defaults to 50 records per page and allows up to 200.
+
+Creating or editing a task through the tasks API accepts up to 200 characters for the title, 64 for the requester name, 200 for contact details and 36 for the requester ID. An over-limit field returns HTTP 422 with its name. When an existing task exceeds these limits, the receipt and notice show shortened titles and names with an ellipsis. They omit over-limit contacts and IDs to avoid directing a reply to the wrong recipient. The optional `fieldWarnings` object identifies each affected field with `truncated` or `omitted`. The completion response exposes the same warnings under `receiptFieldWarnings` and retains the original task values.
+
+## Register client installers
+
+With `client.update`, send one `installer` multipart file to
+`POST /api/v1/admin/client-releases/upload`. Optional `channel` is `stable` or
+`beta`; omitted uses `SODUWORK_PUBLIC_DOWNLOAD_CHANNEL` if configured, otherwise
+beta for a `-beta.N` version and stable for a plain version. Hub reads the packaged
+version and native architecture, checks the filename, hashes the original bytes,
+signs the update manifest and registers a disabled release. Success means registration
+finished. Identical retries return the original record without changing its enabled
+state; different bytes for the same channel/version/artifact identity return 409.
+Each package is independent; no GitHub integration or six-package batch is required.
+
+Configure `CLIENT_UPDATE_SIGNING_KEY_FILE` and `CLIENT_UPDATE_SIGNING_KEY_ID` once
+per publishing environment. The file contains one canonical Base64-encoded 32-byte
+Ed25519 seed, readable by the Hub account, with POSIX mode 0400 or 0600 (equivalent
+restricted ACLs on Windows). Mount it read-only in containers, whose service runs
+as UID/GID 10001. Its public key must match Hub's trust store and already be trusted
+by installed clients. Never generate a key at startup or include private keys in
+images, source, API responses or installers. Missing, unreadable or untrusted
+signing configuration rejects publication with 503; existing downloads still work.
+
+Desktop inspection needs a maintained `7zz` or `7z` on PATH, or an executable path
+in `CLIENT_UPDATE_ARCHIVE_TOOL`; APK inspection needs `aapt` on PATH. The self-host
+image includes both in its `deps` stage. When reusing `HUB_BASE_IMAGE`, rebuild that
+dependency image to include these tools, or use `HUB_BASE_IMAGE=deps`; the runtime
+build rejects bases missing either tool. EXE, DMG, ZIP, DEB, RPM, tar.gz and AppImage inspection never
+executes uploaded code. Temporary extraction is bounded by time, size and nesting.
+APKs use Android manifest metadata. Preserve original package names. The optional
+`bundle` field still accepts offline-signed installers without server signing
+configuration; deployment-run uploads are unchanged. Selecting beta does not rewrite
+the version: plain versions in beta are for manual installation, not automatic updates.
+
 ## Start locally
 
 For a first session, use `sh start.sh` from the repository root; it creates an isolated database, environment, and administrator.
@@ -35,7 +75,84 @@ Direct development uses local configuration and data; keep it separate from real
 
 API documentation: **http://127.0.0.1:9080/docs**. Health check: `GET /healthz`.
 
+### Upgrading local attachment storage
+
+Stop every Hub process that can write to the uploads volume. Back up the database and the entire volume at the same point in time. On NTFS, use a backup that preserves named streams if the deployment predates #336. Start one upgraded Hub with this pair before starting any other writers.
+
+Before serving requests, Hub checks local attachment and conversation handoff references against the older flat and hashed layouts. Each uniquely owned file moves to `uploads/objects-v2/<SHA-256 of the logical key in UTF-8>`. Database keys and display names stay the same. Repeated references to one key are valid. Distinct keys that lead to the same physical file, conflicting sources, or missing active objects require inspection; the preflight leaves the original files in place. An interrupted move can resume on the next startup. Once the volume has its completion marker, reads and deletes use v2 exclusively. Include the marker when moving the volume.
+
+Older Hubs could keep a handoff receipt after deleting its task and archive. An absent archive for such a receipt allows startup when no active reference needs it. If the file still exists, migration preserves it. Attachments used for messages can have no task and still require their bytes.
+
+For a missing active object, use the reported key to locate its database record and a trusted backup from the same deployment. Early Windows installations may have stored bytes in an NTFS named stream. Check ownership and verify the recovered ordinary file against the recorded length and SHA-256 where available. With Hub stopped, place that verified copy at the v2 path for the exact key in the restore copy, preserving the original backup. If ownership or content cannot be established, keep the originals for review. A successful startup and a download matching the original bytes verify recovery. To roll back, stop Hub and restore the old database and uploads volume together before restarting the old version.
+
+### Read-only automation
+
+Use the configured Hub address. The local development example below uses port 9080. The health check is public. To list the projects visible to an account, obtain its bearer token through `POST /api/v1/admin/login` and provide it in `HUB_TOKEN` through your environment or CI secret store. The account needs the `task.view` permission.
+
+```sh
+HUB_URL=http://127.0.0.1:9080
+curl --fail --silent --show-error "$HUB_URL/healthz"
+curl --fail --silent --show-error -H "Authorization: Bearer $HUB_TOKEN" "$HUB_URL/api/v1/admin/projects"
+```
+
+The projects response is a JSON array. An empty array means the account can see no projects. HTTP 401 means the token is missing, invalid or expired. HTTP 403 means the signed-in account lacks the required permission.
+
+## Diagnosing queued dispatches
+
+When the Runner first accepts a dispatch, its log records the execution reference and queue position.
+While it is queued, `GET /api/v1/tasks/{tid}/ai-status` can return `runner.waitReason`.
+`resource_pressure` means the Runner's resource budget is blocking new starts.
+`execution_slot` means all slots available to this work are occupied.
+The Runner pauses new starts when memory use reaches 92% or reported available memory falls below 768 MiB.
+With enough reported memory, CPU readings at or above 95% spanning at least one second allow one task at a time.
+A reading below 95% resets that interval. Memory pressure takes precedence even while CPU use stays high.
+The field is optional. Poll the same task to see the current reason or its transition to running.
+
+For a direct dispatch, the Hub checks the original Runner's durable queue receipt using the
+execution reference and admission key. A matching receipt or per-task heartbeat renews the
+90-second lease, including while memory pressure keeps the task queued. If the Hub loses
+confirmation, the next lease check reports `queueLeaseStatus=unconfirmed` and
+`queueLeaseReason=no_runner_ack`. Device ai-status puts these fields under `runner`; admin
+ai-status returns them at the top level. Reconnecting the Runner triggers a check of its
+persisted queue. Keep the original dispatch while confirmation is pending to avoid duplicate work.
+
+While resource pressure blocks queued work, the Runner periodically logs CPU use, available
+memory and queue depth. A second process opening the same queue exits and reports the last
+registered owner's PID and Runner boot ID.
+
+## Desktop-local Runner event recovery
+
+Desktop-local Runner executions persist their event destination separately from the
+conversation alias. Their history does not enter Hub task delivery, and Hub outbox
+pressure does not block local work; CPU, memory and execution concurrency still apply.
+Queued desktop turns display queue wording instead of model-processing wording.
+
+On upgrade, Runner recognizes old local chat streams only when their alias, runtime
+and deterministic execution reference agree. Recovery persists confirmed local routing;
+ambiguous records retain their original routing metadata. Confirmed local packets are copied to
+private `local-events-*.archive` recovery files before removal from the active outbox;
+Windows payloads retain DPAPI protection. Collection marks are preserved. Ambiguous
+streams and real Hub events remain untouched, and NACK is never treated as ACK.
+Recovery files are bounded to three times the configured outbox byte budget, including
+encoding overhead. Archive failures retain the original packets and emit a diagnostic;
+unrelated Hub delivery and collection continue subject to actual outbox capacity.
+Keep these recovery files private and retain them until their contents have been reviewed.
+Run `python3 -m unittest test_runner_event_scope test_runner_event_delivery` to verify
+routing, restart recovery, interrupted archive writes, and Hub delivery preservation.
+
 ## Managed Pi execution
+
+Agent discovery searches bounded npm-prefix, Homebrew and nvm locations, including installations absent from a desktop process's inherited PATH. A selected executable's version, Node engine and DeepSeek adapter metadata must belong to that installation; unrelated private packages cannot supply those values. Windows Codex discovery continues after an excluded WindowsApps candidate. Explicit Agent overrides, managed runtime ownership and native dependency checks remain enforced. The DeepSeek desktop application alone does not provide the ACP adapter required by the Runner.
+
+Recognized npm JavaScript Agents use the same validated Node and package entry for version probes and execution. A shim's adjacent Node cannot override that selection. Node candidates must satisfy the selected package and host minimum versions; DeepSeek boot checks and their cache also track the selected Node and entry. Native executables and custom wrappers retain their explicit commands.
+
+DeepSeek native packages follow the selected Node's platform, architecture and Linux libc, including Rosetta and mixed-runtime installations. Unknown Node identities fail closed. Launch and version-probe child processes inherit the selected Node directory without modifying the Runner's global PATH; quoted Windows PATH entries retain their priority.
+
+Model capability report v3 tests streaming continuation after a synthetic tool result, with tools retained and no extra user message. Existing v2 tool successes require rechecking; independent evidence remains available. Deploy the matching desktop update. Model refusals include an opaque `soduwork-trace` marker shared by JSON and SSE errors and the transport log; validated upstream request IDs remain correlation metadata, never error-classification input. Generic 403 guidance does not infer credential permissions from the status alone.
+
+Reading older model configurations preserves valid manual capability declarations when another field is incompatible, without rewriting the database. Saving still validates configuration fields and rejects arrays, strings and other non-object values; explicit `config: null` retains its existing reset behavior. Unknown capabilities are not promoted to supported during reads or upgrades, and an inconclusive capability check does not replace manual declarations.
+
+Model transport refusal logs distinguish recognized rate limits, billing failures and unclassified 429 responses without recording provider bodies. Numeric and HTTP-date `Retry-After` values pass through the existing JSON/SSE error contract; waits above one day are bounded to one day, already beyond the desktop retry budget. Billing errors omit retry hints. The Hub does not add a retry loop; the matching desktop update honors the provider wait only within its existing per-turn budget.
 
 Managed Pi execution binds each Runner execution record to its own configuration and session directory under the Runner data root. Startup and follow-up turns use the same explicit path, independent of inherited desktop Pi settings or the operating system home-directory lookup. Model files contain an environment-variable reference for the credential; missing model configuration or failed file publication stops execution before Pi starts. Personal Pi and desktop-local model files are not modified. On upgrade, only the exact native session identified by the Runner record and matching workspace can be copied into the private directory; its original file remains unchanged. Established follow-up turns require an existing session rather than silently starting a new one.
 
@@ -43,7 +160,25 @@ After a Runner restart, recovery terminals bind the same owned history without r
 
 To verify this path with a real Runner and Pi subprocess against a disposable authenticated Hub and loopback model, install the client dependencies and run `python3 e2e_pi_dispatch_config.py --output /absolute/evidence/directory` from the backend test environment. The check covers dispatch, follow-up, output files, native terminal recovery after restart, and preservation of personal model configuration. It does not exercise a production model or native desktop UI.
 
+## Concurrent Runner conversations
+
+Desktop-private and Hub RPCs use bounded work, read, discovery and control lanes. A slow discovery or history read cannot occupy the workers reserved for stopping another conversation. Mutations of one execution reference remain ordered across both transports; stopping it invalidates older requests that have not reached durable admission. Requests rejected for transport capacity are explicitly unaccepted and may be retried with the same business ID. This does not change account authorization, local-model privacy or the adaptive CPU/memory execution budget.
+
+Process creation runs outside the shared session lock. Cancellation retains the exact launch identity until process-tree cleanup is confirmed; an unconfirmed exit does not free its execution slot or authorize a replacement. Event-retention failures preserve the unsaved batch and retry it before resuming Hub-bound admission. An empty current snapshot or an unrelated acknowledgement cannot discard that batch. Desktop-local admission remains independent of Hub event retention.
+
+Model metadata carries its privacy classification from snapshot capture to remote projection. Switching to a Hub model while a read is pending cannot expose an older local model identity or its token counts. Attachment reads and follow-up workers also retain cancellation ownership until the underlying operation finishes.
+
+Run `python3 -m unittest test_runner_local_rpc test_runner_remote_rpc test_runner_event_delivery test_runner_usage_receipts test_runner_input_cleanup test_local_process_cleanup test_task_goal_stop_races` in the backend test environment. The private-pipe test uses a real Runner process and durable queue with synthetic discovery; process-cleanup tests use isolated operating-system children. These checks do not establish real-provider or Windows acceptance when run on another platform.
+
+## Plugin governance counts
+
+`GET /api/v1/admin/plugins/governance` counts distinct visible plugins in `summary.pendingReview` and `summary.attention`. A plugin with an older quarantined version still counts as pending review after a newer version is approved.
+
+`counts.review` and `summary.pendingReviewVersions` count individual versions. `summary.attentionItems` is the sum of all action counts. Each entry in `pluginCounts` gives that plugin's pending version count (`review`) and action count (`attention`). Totals are computed before each queue preview is limited to 30 items. Review actions retain their individual `versionId`. The existing query limits of 1,000 evaluations and 500 runs in the last 30 days still apply to the corresponding action counts.
+
 ## Offline quality gate
+
+Native requirement preparation can save `executionSubmissionChoice` independently of the effective `executionSubmissionMode`. For the `infer` choice, completed and validated primary artifacts resolve the mode to automatic review submission; explicit manual and ambiguous legacy manual values retain their behavior. Review remains a human action owned by the requirement creator. Current-turn delivery issues expose interrupted capture, invalid output or an unavailable creator without changing approval permissions. Upgrade desktop and Hub together for the new choice acknowledgment and issue receipts.
 
 Use the dedicated test environment, not a production service environment:
 
@@ -55,6 +190,10 @@ python3 quality_gate.py --profile extended --scope all
 ```
 
 The manifest in `quality_manifest.py` registers checks and their profiles. Unregistered checks block the gate. `live` checks connect to real Hubs, Runners, providers, or business data; they are not part of default offline acceptance.
+
+Manual acceptance submission commits its review request and notification job together. The HTTP receipt does not wait for device notification delivery, so slow connections cannot leave a successfully submitted requirement looking retryable. The existing notification worker retries failed delivery and projects each recipient's current permissions. Run `python3 -m unittest test_local_requirement_delivery` for receipt, idempotency and transaction rollback regressions.
+
+From `client/`, run `node e2e/run-requirements-isolated.cjs /absolute/evidence/directory /path/to/test/python requirements-manual-submit-race` for an isolated Electron/HTTP check using the production client timeout and synthetic slow notification recipients. The fixture has its own database and files; it does not use real accounts or send remote messages.
 
 Offline checks own their subprocess trees and finish cleanup before returning, including when a command exits before its descendants. On Windows, the gate uses the repository's Windows PowerShell Job helper and releases the command only after Job assignment succeeds. Output is captured in a private temporary file so inherited output handles cannot extend a timeout indefinitely; failure reports retain output produced before the timeout. Run `python3 -m unittest test_quality_gate_cleanup` for real process cleanup regressions on the current platform.
 
@@ -104,6 +243,42 @@ one continuation, plus one more only after successful native compaction. If the
 limit persists, the turn is reported as incomplete with retained progress instead
 of a protocol error. Successful continuation clears the earlier truncation;
 protocol and host-cleanup failures retain priority.
+
+For managed model routes, SoduWork explicitly enables and budgets DeepSeek's
+native automatic compaction. It runs between tool steps within the current turn.
+Its threshold is the smaller of 80% of the
+model context window and the space left after reserving the current output and
+summary budgets. Summary output stays within the model's configured output cap;
+it no longer inherits the native 65,536-token reservation. Ordinary output caps
+are preserved; a cap that would consume almost the whole window is reduced to
+leave input space. Native compaction keeps the existing session, tool results,
+permissions and cancellation ownership, without requiring a new user message.
+This does not turn a provider's individual output limit into a context overflow
+or remove the bounded output recovery described above.
+
+Run `python3 -m unittest test_dsh_gateway test_context_recovery
+test_acp_error_messages test_local_turn_outcome` for model budgets and recovery
+regressions. Configured or inferred context sizes still need to match the actual
+provider; a window too small for the native instructions and tools cannot be made
+usable by compression alone.
+
+For a real native-process check, run `python3 e2e_dsh_auto_compaction.py` with
+the same explicit `--adapter-entry`, `--runtime-root`, `--node` and `--output`
+paths as the lifecycle check above. A synthetic loopback provider drives a 64k
+window through repeated compression in one user prompt. The check compares the
+old provider-only bundle, verifies durable checkpoints and completed tools, and
+requires lower native usage receipts after compaction. This is not a production
+model or desktop UI acceptance test.
+
+Managed Kimi and Qwen also receive the selected model's context window instead
+of inheriting a larger native default. Kimi receives an explicitly configured
+output cap; Qwen retains the operator's sampling and output parameters. Both use
+their own between-step compression. Managed Codex Harness receives the model
+window and an 80% automatic-compaction threshold. Personal-account Codex keeps
+its native model settings, while OpenCode already receives context/output limits
+and retains native automatic compaction. Run `python3 -m unittest
+test_kimi_runtime test_qwen_runtime test_acp_permission_inputs
+test_codex_account_acp` for these configuration and isolation boundaries.
 
 ## Other harness terminal outcomes
 
@@ -232,9 +407,9 @@ Native and ACP OpenCode executions preserve the current turn's provider finish r
 
 ## OpenCode installation and network diagnostics
 
-Runner archive downloads, model-gateway reachability checks and the macOS Runner's secure control connection share a strict TLS trust configuration. By default, they retain Python/OpenSSL system roots and add the packaged `certifi` public CA bundle, including in frozen executables whose build-time OpenSSL certificate paths do not exist on the user's machine. Certificate chains and hostnames remain verified. This does not change external native harnesses' own HTTPS configuration.
+Runner archive downloads, model-gateway reachability checks and secure control connections share one TLS configuration on macOS, Windows and Linux. By default, MIT-licensed `truststore` uses the installed operating system's trust: Security framework on macOS, CryptoAPI on Windows, and the system CA store through OpenSSL on Linux. No packaged public CA bundle is added. Missing native verification support or a rejected certificate fails without retrying under another trust policy. Certificate chains and hostnames remain verified. This does not change external native harnesses' own HTTPS configuration.
 
-Nonempty `SSL_CERT_FILE` or `SSL_CERT_DIR` values explicitly replace that default trust selection; a missing or invalid path fails without falling back to public roots. Supply the complete required trust set when configuring a private CA. Empty values do not select an exclusive override; default path discovery still follows Python/OpenSSL environment semantics. Trust is loaded only for HTTPS requests, including redirects from HTTP; plain HTTP does not depend on certificate configuration. Existing download proxy selection and direct model-gateway routing are unchanged.
+Nonempty `SSL_CERT_FILE` or `SSL_CERT_DIR` values explicitly replace default system trust with the configured CA file or OpenSSL hashed CA directory. A missing or invalid path fails without falling back to system or bundled roots. Supply the complete required trust set when configuring this override. Empty values select default system trust. HTTP clients load trust only for HTTPS requests, including redirects from HTTP; plain HTTP does not depend on certificate configuration. Existing download proxy selection and direct model-gateway routing are unchanged.
 
 The managed installer tries an explicitly configured mirror, the connected Hub, then the official release. On macOS, archive downloads through the Python installer merge system HTTP/HTTPS proxy settings with environment overrides by scheme on every attempt. An explicitly empty proxy variable disables that scheme's system proxy. System-sourced proxies retain their system bypass rules alongside `NO_PROXY`; an empty `NO_PROXY` does not cancel the system exceptions. Explicit proxy overrides retain standard environment bypass behavior, and requests to the exact connected Hub origin stay direct. TLS certificate verification and pinned SHA-256 verification remain enabled. These download rules do not change npm dependency installation or model-gateway routing.
 
@@ -254,14 +429,23 @@ Verify the production network modules with real loopback HTTPS and a frozen PyIn
 python3 e2e_runner_tls.py --output /absolute/evidence/directory
 ```
 
-The check verifies the packaged CA resource, missing default roots, strict explicit overrides, and rejection of untrusted or mismatched certificates. `--source-only` exercises the same paths without freezing. These fixtures do not replace full desktop, production model or other operating-system verification.
+The check verifies the packaged native verifier, real TLS with a disposable trust anchor, strict explicit overrides, and rejection of untrusted or mismatched certificates. It does not modify the machine's trust store. `--source-only` exercises the same paths without freezing. These fixtures do not replace full desktop, production model or other operating-system verification.
 
 ## API and trust boundaries
 
-- Devices enroll with `POST /api/v1/clients/enroll`, then use a short-lived device session. Device long-term keys remain in the Electron main process; Hub stores only their digest.
+The AI proxy's image and video generation routes accept options for the selected media type, such as image size or video duration. A value in the model's configured `defaults` takes precedence over a request option. To set a provider-specific parameter, add it to the model's `defaults` in the catalog. The proxy ignores unrecognized request fields.
+
+When posting usage to `POST /api/v1/usage/events`, omit `occurredAt` to use the time the Hub receives the event. Supply an ISO 8601 timestamp to report an earlier instant. The Hub interprets a timestamp without an offset as UTC. If an event has an invalid timestamp, the Hub returns HTTP 422 before recording any event in the batch. For example, 16:30 without an offset is 00:30 the next day in Beijing. Include `+08:00` to report 16:30 Beijing time.
+
+Omitting `sourceType` selects `chat`. Supported categories are `chat`, `task`, `workflow`, `automation` and `system`. Use the lowercase names as shown. Task and workflow reports require a task the device owns or its account is assigned. Invalid categories return HTTP 422. Each event receipt includes the cumulative stored counters and a `status` of `created`, `updated` (a counter increased), or `duplicate` (no counter increased).
+
+For chat usage, supply the local session ID in `sourceId` or `conversationId`. If both are present, they must match. A receipt keeps its original session on retries. Conflicting references return HTTP 422 for the batch. A report containing only an idempotency key can still count toward usage. Receipts and usage details expose the session ID with `sourceVerification: "verified"` when the Hub conversation directory matches the account, device and session. Until then they return empty IDs and `"unverified"`. Usage reported before conversation sync becomes attributable on the next read.
+
+- A new installation can connect before sign-in. The Hub saves its device ID and key digest after the employee signs in or an administrator pairs the device. Trusted devices renew their short-lived sessions with `POST /api/v1/clients/enroll`. Existing pre-v1 clients can use compatibility mode with an established credential. A fresh pre-v1 installation needs the current desktop client.
+- To pair a device, the employee copies a pairing code from the sign-in screen or Account Security and gives it directly to the administrator. In the device fleet, choose **Pair device**, select the employee and paste the code within ten minutes. The employee can then select **Retry connection** on the desktop. The Hub also requires a fresh code when activating a pending device or changing its owner. Reset a revoked device before requesting a new code.
 - Business requests use `Authorization: Device <session>`. WebSocket connectivity uses the same short-lived session at `/api/v1/ws`.
-- Tasks use `/api/v1/tasks`, task-specific operations, batch updates, completed-task clearing, and agent run/retry/takeover routes. Configuration uses `/api/v1/config`.
-- Administrators sign in at `/api/v1/admin/login` and use bearer tokens for administrator APIs, including clients, tasks, and dispatch.
+- Tasks use `/api/v1/tasks`, task-specific operations, batch updates, completed-task clearing, and agent run/retry/takeover routes. Device preferences use `GET /api/v1/config?withRevision=true`. Send edited fields and the returned `_configRevision` to `PUT /api/v1/config`. The versioned response lists writable fields in `_configKeys`. Unknown fields and invalid values return 422, a stale revision returns 409, and replacing a previously saved value without a revision returns 428.
+- Administrators sign in at `/api/v1/admin/login` and use bearer tokens for administrator APIs, including clients, tasks, and dispatch. After 10 failed sign-ins for one account or 30 from one IP address within a five-minute window, the Hub returns HTTP 429 with the remaining wait in the `Retry-After` header (seconds). The database stores the counters across Hub workers. Failed attempts appear in the audit log as `admin.login.failed`.
 - Long-term device keys must not enter renderers, logs, or URLs. Server state is authoritative; offline client caches must not overwrite it.
 
 Disabling an account invalidates its existing device sessions and AI/tool tickets, returns devices to pending sign-in, and closes their event, terminal and Runner channels. Device keys, configuration and historical ownership are retained. Another active account can sign in on the same device; re-enabling the original account requires a new sign-in and never restores old sessions. Explicit administrator device bans remain revoked and block every account. Devices already revoked by older account-disable behavior require an administrator to review and activate them; account re-enablement does not automatically lift device bans.
@@ -269,6 +453,16 @@ Disabling an account invalidates its existing device sessions and AI/tool ticket
 Account conversation directory and source projections include `contentLocation`: `hub` for legacy Hub content, `source` for content retained by the original endpoint, `replica` for a valid migrated copy at the current source revision, or `unknown` when the reference cannot be established. The field does not expose private replica identifiers or grant access; clients must retain existing account, Hub, and execution checks. An unknown location must not be used to discard a potentially independent local copy.
 
 See [OAuth deployment and validation](CONNECTOR_OAUTH.en.md) for connector credentials and authorization.
+
+### Listing records
+
+Under `/api/v1`, `admin/users`, `admin/orgs`, `admin/roles`, `admin/domains`, `tasks` and `schedules` return their existing arrays when called without pagination. Supply `limit` (1–200) or `offset` (zero-based) to receive `{items, total}`. With only an offset, the page size defaults to 50. The total counts visible records before pagination. An offset past the end returns an empty page.
+
+`GET /api/v1/admin/ai-schedules/{sid}/runs` returns up to 20 recent runs by default. Pass an integer `limit` from 1 to 200. Values outside this range return HTTP 422.
+
+Use `GET /api/v1/admin/client-inventory` for an object containing `items`, `total`, `counts`, `page`, `pageSize` and `offset` on every call. Choose `page` and `pageSize` (1–100, default 25), or `offset` and `limit`. Existing callers of `admin/clients` can still request the legacy array or use `paged=1` for an object.
+
+The library uses the same optional limit and offset across folders first, then files. Its existing `folders` and `items` arrays remain separate, and the paginated response includes their combined `total`. Approvals and deliveries accept a positive limit and a zero-based offset.
 
 ## Requirement migration and access
 
@@ -348,3 +542,7 @@ python3 e2e_dsh_private_probe.py \
 ```
 
 This explicit check uses the production private-probe job and ACP bridge, the installed adapter and host, and a synthetic loopback model. It first reproduces the old incorrect installation path, then requires a real model request and the expected Agent response with the corrected path. It uses disposable home, state and temporary directories, blocks non-loopback Node connections and cleans up its subprocesses. It does not install or update dependencies, use real credentials, or verify desktop UI, production Hub or provider behavior. Run it separately from the offline quality gate because it requires an existing native installation.
+
+## Model provider deletion
+
+With `integration.manage`, request `GET /api/v1/admin/model-providers/{id}/deletion-impact`. The result includes the provider and impact revisions, child models, and visible saved model selections. Member names require `user.manage` and issue titles require `task.view`; department visibility still applies. Submit the revisions as `expectedRevision` and `expectedImpact` plus the exact ID as `confirmId` to the existing `DELETE /api/v1/admin/model-providers/{id}`. Older delete requests without the preview return HTTP 428. On HTTP 409, retrieve a fresh preview and confirm again. Built-in services cannot be deleted.

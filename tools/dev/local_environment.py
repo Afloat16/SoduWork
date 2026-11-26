@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 from functools import lru_cache
+import math
 import os
 from pathlib import Path
 import shutil
@@ -18,18 +19,25 @@ import re
 import tempfile
 import time
 
+from .local_path_check import check_windows_source_paths
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "outputs", "work"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".log", ".db", ".db-shm", ".db-wal"}
 BACKEND_FILES = (
-    "requirements.txt", "requirements-runner.txt", "alembic.ini", "runner_main.py", "db_admin.py",
+    "requirements.txt", "requirements-runner.txt", "requirements-image.txt", "alembic.ini", "runner_main.py", "db_admin.py",
     "full_backup.py", "pack_plugin.py", "client-update-trust.json",
 )
 ELECTRON_DOWNLOAD_TIMEOUT = 600
 NPM_PROBE_TIMEOUT = 15
 NPM_VERSION = re.compile(rb"v?\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
                          rb"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+PORTABLE_GIT_NETWORK_FAILURE = re.compile(
+    rb'\[SoduWork shell runtime\] PortableGit download failed: Runtime download '
+    rb'(?:exceeded total time limit|failed: (?:HTTP \d{3}|ECONNREFUSED|ECONNRESET|ETIMEDOUT|'
+    rb'EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET)))\b'
+)
 
 
 class StartupError(RuntimeError):
@@ -40,9 +48,35 @@ class DiskFullError(StartupError):
     """A storage failure that must not be replaced with download advice."""
 
 
+def electron_download_timeout() -> float:
+    """Electron download deadline in seconds; honor ELECTRON_DOWNLOAD_TIMEOUT.
+
+    docs/getting-started.md documents this variable as a way for slow
+    connections to raise the 600-second deadline, so read it at use time
+    instead of relying on the module constant. Invalid values fail loudly
+    rather than being silently ignored.
+    """
+    raw = os.environ.get('ELECTRON_DOWNLOAD_TIMEOUT', '').strip()
+    if not raw:
+        return float(ELECTRON_DOWNLOAD_TIMEOUT)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise StartupError(
+            'ELECTRON_DOWNLOAD_TIMEOUT must be a positive number of seconds; '
+            'got a non-numeric value'
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise StartupError(
+            'ELECTRON_DOWNLOAD_TIMEOUT must be a positive, finite number of seconds'
+        )
+    return value
+
+
 def command_failure(message: str, log: Path, offset: int) -> StartupError:
     """Classify only this attempt, without echoing potentially private output."""
     prefix = f"{message}. See {log}. "
+    portable_git_download_failed = False
     try:
         with log.open('rb') as output:
             output.seek(offset)
@@ -54,9 +88,17 @@ def command_failure(message: str, log: Path, offset: int) -> StartupError:
                     return DiskFullError(prefix + '磁盘空间不足 / Disk full. '
                                          'Free space on the data, cache or temporary-directory volume '
                                          'and retry; completed steps are reused.')
+                if PORTABLE_GIT_NETWORK_FAILURE.search(text):
+                    portable_git_download_failed = True
                 tail = text[-128:]
     except OSError:
         pass  # Preserve the command failure even if its log cannot be read.
+    if portable_git_download_failed:
+        return StartupError(prefix + 'PortableGit 下载失败。检查代理 HTTP_PROXY / HTTPS_PROXY，'
+                            '或设置镜像 SODUWORK_PORTABLE_GIT_MIRROR。已有离线包时，用 '
+                            'SODUWORK_PORTABLE_GIT_ARCHIVE 指定文件，再运行原启动命令。\n'
+                            'Check your proxy, set a PortableGit mirror, or specify a verified local archive, '
+                            'then rerun the same launcher. See docs/getting-started.en.md.')
     return StartupError(prefix + 'Check the failing step in the log for the cause and retry; '
                         'completed steps are reused.')
 
@@ -115,7 +157,7 @@ def run(command: list[str], *, cwd: Path, log: Path, label: str,
         output.write(("\n--- " + label + " ---\n").encode("utf-8"))
         output.flush()
         offset = output.tell()
-        with subprocess.Popen(command, cwd=cwd, env=env, stdout=output,
+        with subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output,
                               stderr=subprocess.STDOUT, **spawn_options()) as child:
             try:
                 code = wait_child(child, progress_label=label, timeout=timeout)
@@ -234,6 +276,26 @@ def source_files(source: Path):
             yield path
 
 
+def source_copy_targets():
+    """Relative destinations of the source files copied by prepare()."""
+    directories = ("hub-backend/app", "hub-backend/migrations", "hub-backend/installers",
+                   "hub-backend/plugins", "skills", "client", "third-party",
+                   "hub-frontend/src", "hub-frontend/public")
+    for name in directories:
+        for source in source_files(ROOT / name):
+            yield Path("application") / source.relative_to(ROOT)
+    for name in BACKEND_FILES:
+        if (ROOT / "hub-backend" / name).is_file():
+            yield Path("application/hub-backend") / name
+    for name in ("package.json", "package-lock.json", "index.html", "vite.config.js"):
+        if (ROOT / "hub-frontend" / name).is_file():
+            yield Path("application/hub-frontend") / name
+    if (ROOT / "tools/dev/local_server.py").is_file():
+        yield Path("application/hub-backend/_soduwork_source_server.py")
+    if (ROOT / "LICENSE").is_file():
+        yield Path("application/LICENSE")
+
+
 def sync_source(source: Path, target: Path, *, preserve: frozenset[str] = frozenset()) -> None:
     """Target is a dedicated generated-code directory, never a runtime root."""
     target.mkdir(parents=True, exist_ok=True)
@@ -276,7 +338,7 @@ def read_stamp(path: Path) -> str:
 
 def verify_runner_environment(python: Path, backend: Path, log: Path, *, env: dict) -> None:
     """Check imports and the control-channel API without starting a Runner."""
-    probe = ("import inspect, sys, websockets, yaml, pg8000, pymysql, pymongo, dns, redis, cryptography\n"
+    probe = ("import inspect, sys, websockets, yaml, pg8000, pymysql, pymongo, dns, redis, cryptography, truststore\n"
              "assert sys.version_info >= (3, 12), 'Runner requires Python 3.12+'\n"
              "assert {'additional_headers', 'proxy'} <= set(inspect.signature(websockets.connect).parameters), "
              "'Runner requires the websockets 15+ connection API'\n")
@@ -303,7 +365,54 @@ def prepare_environment(state: Path) -> dict[str, str]:
     return env
 
 
+def venv_interpreter_error(python: Path, venv: Path, log: Path) -> StartupError:
+    """Explain a missing venv interpreter, and record the same reason in the log.
+
+    A venv command can report success while producing a layout this launcher cannot
+    use. Every later step only names this log file, so the diagnosis has to be there
+    too, not just on the terminal.
+    """
+    posix = next((candidate for candidate in (venv / "bin" / "python.exe", venv / "bin" / "python")
+                  if candidate.is_file()), None)
+    facts = [
+        f"expected interpreter: {python}",
+        f"interpreter that created the venv: {sys.executable}",
+        f"os.name={os.name}",
+    ]
+    if posix is not None:
+        facts.append(f"interpreter found in a POSIX layout: {posix}")
+    # Claim an MSYS2/Cygwin layout only when the POSIX interpreter is really there,
+    # so other platforms get the actual missing path instead of Windows advice.
+    if os.name == "nt" and posix is not None:
+        message = (
+            f"独立环境没有生成 {python}，但在 {posix} 找到了 POSIX 布局的解释器。当前解释器 "
+            f"{sys.executable} 可能是 MSYS2/Cygwin 版本，它创建的 venv 使用 bin/ 而不是 Scripts/。"
+            "请改用 python.org 的官方 Windows 版（或 py -3.12）后重跑同一入口；"
+            "已经创建的数据目录会直接复用，不需要删除。\n"
+            f"The private environment does not contain {python}, but a POSIX-layout interpreter exists at "
+            f"{posix}. {sys.executable} looks like an MSYS2/Cygwin build, whose venv uses bin/ instead of "
+            "Scripts/. Use a native python.org Windows build (or py -3.12) and run the same launcher again; "
+            "the existing data directory is reused.")
+    else:
+        message = (
+            f"独立环境没有生成 {python}。创建 venv 的解释器是 {sys.executable}（os.name={os.name}）。"
+            "请确认这个解释器可以正常执行 `-m venv`，修复后重跑同一入口；"
+            "已经创建的数据目录会直接复用，不需要删除。\n"
+            f"The private environment does not contain {python}. The interpreter that created it was "
+            f"{sys.executable} (os.name={os.name}). Check that this interpreter can run `-m venv`, then run "
+            "the same launcher again; the existing data directory is reused.")
+    details = "\n".join(facts)
+    try:
+        with log.open("ab") as output:
+            output.write(("\n--- 独立环境诊断 / private environment diagnosis ---\n"
+                          + details + "\n" + message + "\n").encode("utf-8"))
+    except OSError:
+        pass  # A diagnosis must never mask the original failure.
+    return StartupError(message + "\n" + details)
+
+
 def prepare(state: Path, log: Path) -> tuple[Path, Path]:
+    check_windows_source_paths(state, source_copy_targets(), probe=True)
     _, npm = check_dependencies()
     cache_env = prepare_environment(state)
     runtime = state / "application"
@@ -324,16 +433,20 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
 
     venv = state / "venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    # Keep the caller's module paths out of pip and its build subprocesses.
+    python_env = {key: value for key, value in cache_env.items() if key not in ("PYTHONHOME", "PYTHONPATH")}
     if not python.is_file():
-        run([sys.executable, "-m", "venv", str(venv)], cwd=state, log=log, env=cache_env,
+        run([sys.executable, "-I", "-m", "venv", str(venv)], cwd=state, log=log, env=python_env,
             label="[1/4] 创建独立环境 / Creating a private Python environment")
+        if not python.is_file():
+            raise venv_interpreter_error(python, venv, log)
     requirements = [ROOT / "hub-backend" / name for name in ("requirements.txt", "requirements-runner.txt")]
     py_stamp = state / "python-dependencies.sha256"
-    wanted = digest_files(requirements, ROOT)
+    wanted = digest_files([*requirements, ROOT / "hub-backend" / "requirements-image.txt"], ROOT)
     install = read_stamp(py_stamp) != wanted
     if not install:
         try:
-            verify_runner_environment(python, backend, log, env=cache_env)
+            verify_runner_environment(python, backend, log, env=python_env)
         except DiskFullError:
             raise
         except StartupError:
@@ -341,11 +454,11 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
             # launcher's environment, never a checkout or activated shell venv.
             install = True
     if install:
-        run([str(python), "-m", "pip", "install", "--disable-pip-version-check",
+        run([str(python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
              *[argument for file in requirements for argument in ("-r", str(file))]], cwd=state, log=log,
-            env=cache_env,
+            env=python_env,
             label="[2/4] 安装服务依赖 / Installing server dependencies (first run needs internet)")
-        verify_runner_environment(python, backend, log, env=cache_env)
+        verify_runner_environment(python, backend, log, env=python_env)
         py_stamp.write_text(wanted, encoding="utf-8")
 
     source = ROOT / "hub-frontend"
@@ -369,7 +482,7 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
         if (source / name).is_dir():
             files.extend(source_files(source / name))
     files.extend((ROOT / "client" / name) for name in (
-        "core/connector-brand.js", "components/panels/connector-config.js",
+        "core/connector-brand.js", "core/locales/builtin-skills.js", "components/panels/connector-config.js",
         "components/client-auth/legal-html.js", "components/client-auth/legal-html.css"))
     files.extend(source_files(ROOT / "client/assets/connector-brands"))
     wanted = digest_files(files, ROOT)
@@ -419,13 +532,13 @@ def prepare_desktop(state: Path, log: Path) -> Path:
         # npm versions differ in install-script policy. Download the locked Electron
         # runtime explicitly without enabling unrelated dependencies' lifecycle scripts.
         if not electron_binary(client).is_file():
-            print("桌面运行环境下载最多等待 10 分钟 / Electron download allows up to 10 minutes. "
+            print(f"桌面运行环境下载最多等待 {electron_download_timeout():.0f} 秒 / Electron download allows up to {electron_download_timeout():.0f} seconds. "
                   "If GitHub is unreachable, configure ELECTRON_MIRROR or your proxy and retry.", flush=True)
             try:
                 run([node, str(client / 'scripts/install-electron.cjs')], cwd=client, log=log,
                     label='[Desktop] 下载桌面运行环境 / Downloading the Electron runtime',
                     env=electron_install_environment(cache_env),
-                    timeout=ELECTRON_DOWNLOAD_TIMEOUT)
+                    timeout=electron_download_timeout())
             except DiskFullError:
                 raise
             except StartupError as exc:
