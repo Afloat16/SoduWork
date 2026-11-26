@@ -103,6 +103,9 @@ When the Runner first accepts a dispatch, its log records the execution referenc
 While it is queued, `GET /api/v1/tasks/{tid}/ai-status` can return `runner.waitReason`.
 `resource_pressure` means the Runner's resource budget is blocking new starts.
 `execution_slot` means all slots available to this work are occupied.
+Under normal load, independent desktop chats can start while earlier chats are still generating replies.
+The Runner reserves 768 MiB of available memory and budgets 512 MiB per concurrent chat startup, up to its configured ceiling.
+Starts that stage attachments, plugins or workspaces also share the adaptive preparation budget. They release it once the native Agent starts.
 The Runner pauses new starts when memory use reaches 92% or reported available memory falls below 768 MiB.
 With enough reported memory, CPU readings at or above 95% spanning at least one second allow one task at a time.
 A reading below 95% resets that interval. Memory pressure takes precedence even while CPU use stays high.
