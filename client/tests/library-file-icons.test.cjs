@@ -45,7 +45,7 @@ test('a broken shell handler times out to the real system generic icon', async (
 
 test('native icon lookup recovers after its temporary directory becomes available', async t => {
   const fs = require('node:fs/promises'), os = require('node:os'), path = require('node:path');
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'sodu-icon-recovery-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'soduwork-icon-recovery-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const temp = path.join(root, 'not-ready'); let calls = 0;
   const service = createService({ platform: 'linux', app: { getPath: () => temp,
