@@ -461,6 +461,20 @@ test('bounded 206 chunks retain the pinned complete archive size', async t => {
   assert.equal(fs.existsSync(target + '.part'), false);
 });
 
+test('a pinned archive finishes without another request when Content-Range omits the total', async t => {
+  const content = 'complete-range-fixture', target = directory(t);
+  fs.writeFileSync(target + '.part', content.slice(0, 3));
+  const source = await origin(t, (request, response) => {
+    if (request.headers.range !== 'bytes=3-') { response.writeHead(416); response.end(); return; }
+    response.writeHead(206, { 'Content-Range': `bytes 3-${content.length - 1}/*` });
+    response.end(content.slice(3));
+  });
+  await downloadFile(source.url, target, options({}, { resume: true, expectedBytes: content.length }));
+  assert.equal(source.received.length, 1);
+  assert.equal(fs.readFileSync(target, 'utf8'), content);
+  assert.equal(fs.existsSync(target + '.part'), false);
+});
+
 test('a 206 body length mismatch keeps the verified prefix and never replaces an existing runtime', async t => {
   for (const body of ['de', 'defgh']) {
     const target = directory(t);

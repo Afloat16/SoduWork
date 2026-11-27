@@ -143,7 +143,8 @@ async function downloadFile(url, target, { environment = process.env, timeoutMs 
           throw new DownloadError('Runtime download body does not match its byte range');
         }
         // A server may cap a Range response before the end of the archive.
-        if (interval[3] === '*' || bytes < Number(interval[3])) continue;
+        const totalBytes = interval[3] === '*' ? expectedBytes : Number(interval[3]);
+        if (totalBytes === undefined || bytes < totalBytes) continue;
       }
       if (expectedBytes !== undefined && bytes !== expectedBytes) {
         throw new DownloadError('Runtime download ended before the expected archive size');
