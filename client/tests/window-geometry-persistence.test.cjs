@@ -9,7 +9,7 @@ const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 
 test('quitting flushes the final geometry and maximized flag before the debounce', t => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sodu-geometry-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-geometry-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const app = new EventEmitter(); app.getPath = () => dir;
   const tasks = new Map(); let next = 0;
