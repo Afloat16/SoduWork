@@ -24,6 +24,38 @@ from app.services import device_auth, model_config_guard, runtime_images, ai_exe
 
 
 class CapabilityTests(IsolatedDatabase):
+    async def test_check_durations_survive_partial_recheck_and_saved_catalog_reload(self):
+        open_response = probe.model_transport.open_response
+
+        async def delayed(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return await open_response(*args, **kwargs)
+
+        with patch.object(probe.model_transport, "open_response", side_effect=delayed):
+            response = await self.check()
+        self.assertEqual(response.status_code, 200, response.text)
+        initial = response.json()
+        for check in initial["checks"].values():
+            self.assertGreaterEqual(check["durationMs"], 15)
+            self.assertEqual(check["status"], "passed")
+        self.assertGreaterEqual(initial["checks"]["toolCalling"]["durationMs"], 30)
+        async with self.sessions() as session:
+            saved = (await catalog.catalog(session))["models"][0]["capabilityCheck"]
+        self.assertEqual(saved["checks"], initial["checks"])
+
+        response = await self.check(checks=["streaming"])
+        self.assertEqual(response.status_code, 200, response.text)
+        updated = response.json()
+        self.assertEqual(updated["runSequence"], initial["runSequence"] + 1)
+        self.assertEqual(updated["runtimeRevision"], initial["runtimeRevision"])
+        for key in ("connection", "imageInput", "toolCalling"):
+            self.assertEqual(updated["checks"][key], initial["checks"][key])
+        self.assertGreaterEqual(updated["checks"]["streaming"]["durationMs"], 0)
+        self.assertNotEqual(updated["checks"]["streaming"]["checkedAt"], initial["checks"]["streaming"]["checkedAt"])
+        async with self.sessions() as session:
+            saved = (await catalog.catalog(session))["models"][0]["capabilityCheck"]
+        self.assertEqual(saved["checks"], updated["checks"])
+
     async def test_creation_receipt_precedes_a_concurrent_edit_after_commit(self):
         from app.api import admin
         from app.services import client_domain_events
@@ -74,6 +106,78 @@ class CapabilityTests(IsolatedDatabase):
             self.assertEqual(response.status_code, 400, response.text)
         async with self.sessions() as session:
             self.assertEqual((await session.get(ModelDef, "p:model")).ctx_window, 128000)
+
+    async def test_admin_invalid_config_types_do_not_commit_other_changes(self):
+        from app.api import admin
+        self.app.include_router(admin.router)
+        original = {"imageRouting": "auto", "capabilities": {"toolCalling": "supported"}}
+        async with self.sessions() as session:
+            model = await session.get(ModelDef, "p:model")
+            model.config = original
+            model.label = "Original label"
+            await session.commit()
+            revision = model_config_guard.revision(model)
+        for value in ([], ["config"], "invalid", True, 123):
+            with self.subTest(value=value):
+                response = await self.http.put("/api/v1/admin/model-defs", headers=self.headers["admin"],
+                    json={"providerId": "p", "name": "model", "expectedRevision": revision,
+                          "label": "Should not be saved", "enabled": False, "config": value})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.headers.get("X-Error-Code"), "model.config.invalid-object")
+                async with self.sessions() as session:
+                    model = await session.get(ModelDef, "p:model")
+                    self.assertEqual(model.config, original)
+                    self.assertEqual(model.label, "Original label")
+                    self.assertTrue(model.enabled)
+        response = await self.http.put("/api/v1/admin/model-defs", headers=self.headers["admin"],
+            json={"providerId": "p", "name": "invalid-new", "expectedRevision": "new", "config": []})
+        self.assertEqual(response.status_code, 400, response.text)
+        async with self.sessions() as session:
+            self.assertIsNone(await session.get(ModelDef, "p:invalid-new"))
+
+    async def test_admin_edit_after_legacy_read_preserves_manual_capabilities(self):
+        from app.api import admin
+        self.app.include_router(admin.router)
+        declared = {"imageInput": "unknown", "toolCalling": "supported", "streaming": "supported"}
+        for invalid in ({"thinkingFormat": "unrecognized-format"}, {"maxOutputTokens": 512}):
+            with self.subTest(invalid=invalid):
+                original = {"imageRouting": "auto", "capabilities": declared, **invalid}
+                async with self.sessions() as session:
+                    model = await session.get(ModelDef, "p:model")
+                    model.config = original
+                    await session.commit()
+                response = await self.http.get("/api/v1/admin/model-catalog", headers=self.headers["admin"])
+                self.assertEqual(response.status_code, 200, response.text)
+                view = next(row for row in response.json()["models"] if row["id"] == "p:model")
+                self.assertEqual(view["config"]["capabilities"], declared)
+                self.assertEqual(view["capabilityProfile"]["toolCalling"]["source"], "configured")
+                async with self.sessions() as session:
+                    # Reading a legacy row must never silently migrate the database.
+                    self.assertEqual((await session.get(ModelDef, "p:model")).config, original)
+                response = await self.http.put("/api/v1/admin/model-defs", headers=self.headers["admin"],
+                    json={"providerId": "p", "name": "model", "expectedRevision": view["revision"],
+                          "label": "Label-only edit", "modality": "chat", "config": view["config"]})
+                self.assertEqual(response.status_code, 200, response.text)
+                async with self.sessions() as session:
+                    model = await session.get(ModelDef, "p:model")
+                    self.assertEqual(model.config["capabilities"], declared)
+                    self.assertEqual(model.label, "Label-only edit")
+
+    async def test_admin_empty_and_null_config_keep_explicit_reset_compatibility(self):
+        from app.api import admin
+        self.app.include_router(admin.router)
+        for empty in ({}, None):
+            with self.subTest(empty=empty):
+                async with self.sessions() as session:
+                    model = await session.get(ModelDef, "p:model")
+                    model.config = {"capabilities": {"toolCalling": "supported"}}
+                    await session.commit()
+                    revision = model_config_guard.revision(model)
+                response = await self.http.put("/api/v1/admin/model-defs", headers=self.headers["admin"],
+                    json={"providerId": "p", "name": "model", "expectedRevision": revision, "config": empty})
+                self.assertEqual(response.status_code, 200, response.text)
+                async with self.sessions() as session:
+                    self.assertEqual((await session.get(ModelDef, "p:model")).config, {})
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -145,9 +249,19 @@ class CapabilityTests(IsolatedDatabase):
                 status, data = "400 Bad Request", b'{"error":{"message":"image input is not supported"}}'
             elif self.mode == "private-error":
                 status, data = "401 Unauthorized", b'{"error":{"message":"company-private secret internal response"}}'
+            elif self.mode == "plain-tools" and body.get("tools") and body.get("stream"):
+                status, data = "400 Bad Request", b'{"error":{"code":"tools_not_supported"}}'
             elif body.get("stream"):
                 content_type = "text/event-stream"
-                if body.get("tools"):
+                tool_result = next((row for row in body["messages"] if row["role"] == "tool"), None)
+                if tool_result:
+                    if self.mode == "receipt-requires-choice" and "tool_choice" not in body:
+                        status, content_type = "403 Forbidden", "application/json"
+                        data = b'{"error":{"message":"synthetic receipt policy refusal"}}'
+                    else:
+                        data = ("data: " + json.dumps({"choices": [{"index": 0, "delta": {
+                            "content": tool_result["content"]}, "finish_reason": "stop"}]}) + "\n\ndata: [DONE]\n\n").encode()
+                elif body.get("tools"):
                     if self.mode == "json-tools-only":
                         status, content_type = "400 Bad Request", "application/json"
                         data = b'{"error":{"message":"streamed tools request not accepted"}}'
@@ -182,7 +296,8 @@ class CapabilityTests(IsolatedDatabase):
                     self.assertNotIn(self.challenge, body["messages"][0]["content"][0]["text"])
                     wrong = str((int(self.challenge[0]) + 1) % 10) + self.challenge[1:]
                     message = {"content": self.challenge if self.mode != "wrong-image" else wrong}
-                data = json.dumps({"choices": [{"message": message, "finish_reason": "stop"}]}).encode()
+                finish = "tool_calls" if "tool_calls" in message else "stop"
+                data = json.dumps({"choices": [{"message": message, "finish_reason": finish}]}).encode()
             writer.write(("HTTP/1.1 " + status + "\r\nContent-Type: " + content_type +
                           "\r\nContent-Length: " + str(len(data)) + "\r\nConnection: close\r\n\r\n").encode() + data)
             await writer.drain()
@@ -208,8 +323,8 @@ class CapabilityTests(IsolatedDatabase):
         tool_request = next(body for _, body in self.requests if body.get("tools"))
         receipt_request = next(body for _, body in self.requests if any(row["role"] == "tool" for row in body["messages"]))
         self.assertTrue(tool_request["stream"])
-        self.assertFalse(receipt_request["stream"])
-        self.assertNotIn("tools", receipt_request)
+        self.assertTrue(receipt_request["stream"])
+        self.assertEqual(receipt_request["tools"], tool_request["tools"])
         self.assertNotIn("tool_choice", receipt_request)
         self.assertTrue(all("Bearer alice-private" in headers for headers, _ in self.requests))
         self.assertEqual(result["capabilityProfile"]["imageInput"]["source"], "verified")
@@ -244,6 +359,19 @@ class CapabilityTests(IsolatedDatabase):
             self.assertEqual(events[0].action, "model.capability_check")
             self.assertEqual(events[0].target_id, "p:model")
             self.assertEqual(events[0].detail, {"checks": {"connection": "passed"}})
+
+    async def test_single_check_reports_its_own_success_and_retains_other_evidence(self):
+        self.mode = "wrong-image"
+        first = (await self.check(checks=["connection", "imageInput"])).json()
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["checks"]["imageInput"]["status"], "inconclusive")
+
+        response = await self.check(checks=["connection"])
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["checks"]["connection"]["status"], "passed")
+        self.assertEqual(result["checks"]["imageInput"], first["checks"]["imageInput"])
+        self.assertTrue(result["ok"])
 
     async def test_admin_recheck_repairs_and_persists_cached_named_tool_choice(self):
         first = await self.check("admin", ["connection"])
@@ -300,6 +428,17 @@ class CapabilityTests(IsolatedDatabase):
         self.assertEqual(fresh.json()["checks"]["connection"]["status"], "passed")
         self.assertEqual(len(self.requests), 1)
 
+    async def test_receipt_probe_uses_runtime_default_choice_and_keeps_independent_stream_check(self):
+        self.mode = "receipt-requires-choice"
+        response = await self.check(checks=["connection", "toolCalling", "streaming"])
+        self.assertEqual(response.status_code, 200)
+        checks = response.json()["checks"]
+        self.assertEqual(checks["connection"]["status"], "passed")
+        self.assertEqual(checks["streaming"]["status"], "passed")
+        self.assertEqual(checks["toolCalling"]["status"], "inconclusive")
+        self.assertEqual(checks["toolCalling"]["code"], "request_rejected")
+        self.assertEqual(checks["toolCalling"]["stage"], "tool_result")
+
     async def test_json_only_tools_do_not_enable_streamed_tool_runtime(self):
         self.mode = "json-tools-only"
         response = await self.check(checks=["toolCalling", "streaming"])
@@ -310,6 +449,21 @@ class CapabilityTests(IsolatedDatabase):
         self.assertEqual(result["capabilityProfile"]["toolCalling"]["state"], "unknown")
         self.assertEqual(result["checks"]["streaming"]["status"], "passed")
         self.assertTrue(self.requests[0][1]["stream"])
+
+    async def test_admin_verifies_plain_tool_round_trip_separately_from_text_streaming(self):
+        self.mode = "plain-tools"
+        response = await self.check(checks=["connection", "imageInput", "toolCalling", "streaming"])
+        self.assertEqual(response.status_code, 200)
+        report = response.json()
+        self.assertEqual(report["capabilityProfile"]["toolCalling"]["state"], "supported")
+        self.assertEqual(report["checks"]["toolCalling"]["stage"], "tool_result")
+        self.assertTrue(all(check["status"] == "passed" for check in report["checks"].values()))
+        tool_requests = [body for _, body in self.requests if "tools" in body]
+        self.assertEqual(len(tool_requests), 3)
+        self.assertTrue(tool_requests[0]["stream"])
+        for body in tool_requests[1:]:
+            self.assertEqual(set(body), {"model", "messages", "tools"})
+        self.assertEqual([row["role"] for row in tool_requests[2]["messages"]], ["user", "assistant", "tool"])
 
     async def test_organization_evidence_follows_org_credentials_and_runtime_revision_changes(self):
         async with self.sessions() as session:
@@ -353,12 +507,16 @@ class CapabilityTests(IsolatedDatabase):
             self.assertIsNone(row["capabilityCheck"])
             self.assertEqual(row["capabilityProfile"]["imageInput"]["state"], "unknown")
 
-    async def test_timeout_unsupported_and_bad_answer_have_distinct_truthful_results(self):
+    async def test_timeout_keeps_capability_unconfirmed(self):
         self.mode = "timeout"
         with patch.object(probe, "TIMEOUT", .15):
             result = (await self.check(checks=["imageInput"])).json()
         self.assertEqual(result["checks"]["imageInput"]["status"], "inconclusive")
+        self.assertEqual(result["checks"]["imageInput"]["code"], "timeout")
         self.assertEqual(result["capabilityProfile"]["imageInput"]["state"], "unknown")
+
+    async def test_unsupported_and_bad_answer_have_distinct_truthful_results(self):
+        # Keep timeout cancellation on a separate listener from response checks.
         self.mode = "wrong-image"
         result = (await self.check(checks=["imageInput"])).json()
         self.assertEqual(result["checks"]["imageInput"]["code"], "expected_output_missing")
@@ -595,7 +753,7 @@ class CapabilityTests(IsolatedDatabase):
         self.assertEqual(before["capabilityCheck"]["checks"]["toolCalling"]["code"], "legacy_recheck_required")
         self.assertEqual(before["capabilityProfile"]["toolCalling"]["state"], "unknown")
         result = (await self.check(checks=["connection"])).json()
-        self.assertEqual(result["reportVersion"], 2)
+        self.assertEqual(result["reportVersion"], 3)
         self.assertEqual(result["verifiedChecks"]["imageInput"]["status"], "passed")
         self.assertEqual(result["imageRouting"], "native")
         self.assertNotIn("toolCalling", result["verifiedChecks"])

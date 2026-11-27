@@ -8,6 +8,7 @@ export const CAPABILITY_STATES = localeMap(() => ({ unknown: '未确认', suppor
 const SOURCES = localeMap(() => ({ configured: '手动配置', 'legacy-native': '已有配置', verified: '实际检测', unknown: '未确认' }))
 const STATUS = localeMap(() => ({ passed: '检测通过', failed: '检测失败', unsupported: '不支持', inconclusive: '未能确认', cancelled: '已取消', skipped: '未执行' }))
 const DIAGNOSTICS = localeMap(() => ({
+  request_rejected: '服务拒绝了检测请求，原因尚未确认',
   timeout: '服务响应超时，可稍后重试', temporarily_unavailable: '服务暂时不可用，可稍后重试',
   credentials_or_access: '请检查凭据及模型访问权限', model_or_endpoint_missing: '请检查模型 ID 和接口地址',
   capability_not_supported: '服务明确返回不支持此能力', request_not_accepted: '服务未接受检测请求，请检查协议配置',
@@ -55,7 +56,8 @@ export function CapabilityBadges({ model }) {
   const retainedImage = usesPreviousImageCheck(model, model.capabilityCheck, profile.imageInput)
   return <div className="model-cap-badges">{Object.entries(profile).map(([key, value]) => {
     // Merged reports can contain attempts from different runs. Use this capability's record.
-    const lastStatus = model.capabilityCheck?.checks?.[key]?.status ?? value.checkStatus
+    const attempt = model.capabilityCheck?.checks?.[key]
+    const lastStatus = attempt?.status ?? value.checkStatus
     const lastStatusLabel = knownMessage(STATUS, lastStatus)
     const attemptState = lastStatus === 'passed' ? 'supported' : lastStatus === 'unsupported' ? 'unsupported' : 'unknown'
     const showAttempt = key !== 'imageInput' || !retainedImage
@@ -71,7 +73,8 @@ export function CapabilityBadges({ model }) {
     return <span key={key} className={'model-cap-badge is-' + (value.state === 'supported' ? 'supported' : 'neutral')}
       title={tx(knownMessage(SOURCES, value.source) || SOURCES.unknown)}>
       {tx(CAPABILITY_LABELS[key])}<b>{label}</b>
-      {showLastAttempt && <small>{tx('最近检测：{0}', [lastStatusLabel])}</small>}
+      {showLastAttempt && <small>{lastStatus === 'inconclusive' && attempt?.code === 'protocol_not_tested'
+        ? DIAGNOSTICS.protocol_not_tested : tx('最近检测：{0}', [lastStatusLabel])}</small>}
       {value.conflict && <small title={tx('配置与最近检测结果不一致')}>{tx('配置冲突')}</small>}
     </span>})}</div>
 }
@@ -86,11 +89,15 @@ export function CapabilityReport({ result, model, disabled }) {
       const retained = key === 'imageInput' && retainedImage
       const rejected = retained && check.status === 'unsupported'
       const stage = knownMessage(STAGES, check.stage)
+      const duration = typeof check.durationMs === 'number' && Number.isFinite(check.durationMs) && check.durationMs >= 0
+        ? new Intl.NumberFormat(locale, { style: 'unit', unit: check.durationMs < 1000 ? 'millisecond' : 'second',
+          unitDisplay: 'short', maximumFractionDigits: 2 }).format(check.durationMs < 1000 ? check.durationMs : check.durationMs / 1000) : ''
       const detail = key === 'imageInput' && check.detailCode === 'expected_output_mismatch'
         ? deferredMessageKey('未收到与图片中六位数字完全一致的回复')
         : knownMessage(DETAIL_DIAGNOSTICS, check.detailCode) || knownMessage(DIAGNOSTICS, check.code)
       return <div key={key}><dt>{CAPABILITY_LABELS[key] || tx('服务连接')}</dt>
         <dd className={'is-' + check.status}>{tx(rejected ? '本次检测未通过' : STATUS[check.status] || STATUS.inconclusive)}</dd>
+        {duration && <small>{tx('耗时：{0}', [duration])}</small>}
         {stage && <small>{tx(stage)}</small>}
         {rejected ? <small>{tx('服务拒绝了本次图片请求。对话沿用上次通过的结果，你仍可发图。')}</small> : detail && <small>{tx(detail)}</small>}
         {retained && !rejected && <small>{tx('对话沿用上次通过的结果，你仍可发图。')}</small>}

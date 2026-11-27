@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import models
 from ..memory_record_models import MemoryRecord
 from ..deps import has_perm
+from ..timestamps import iso_utc
 
 SCOPES = {"session", "workspace", "project"}
 ORG_SCOPE = "org"
@@ -170,8 +171,8 @@ def view(row: MemoryRecord, detail: bool = False) -> dict:
         "title": row.title, "summary": row.summary,
         "revision": row.revision, "archived": bool(row.archived),
         "sourceMeta": dict(row.source_meta or {}),
-        "createdAt": row.created_at.isoformat() if row.created_at else None,
-        "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
+        "createdAt": iso_utc(row.created_at) if row.created_at else None,
+        "updatedAt": iso_utc(row.updated_at) if row.updated_at else None,
     }
     if detail:
         result["fields"] = dict(row.fields or {})
@@ -320,7 +321,7 @@ async def edit(session: AsyncSession, client, rid: str, body: MemoryPatch) -> di
     return {"ok": True, "item": view(row, True)}
 
 
-async def delete(session: AsyncSession, client, rid: str) -> dict:
+async def delete(session: AsyncSession, client, rid: str, revision: int | None = None) -> dict:
     """Permanently remove a client-owned summary record.
 
     Client deletion is intentionally separate from archive/restore: callers can
@@ -328,19 +329,37 @@ async def delete(session: AsyncSession, client, rid: str) -> dict:
     forget a summary. ``get`` enforces the owner and organization boundary.
     """
     row = await get(session, client, rid)
-    await session.delete(row)
+    # Older clients omit the revision; still guard against edits after this read.
+    expected_revision = row.revision if revision is None else revision
+    deleted_id = await session.scalar(sql_delete(MemoryRecord).where(
+        MemoryRecord.id == row.id, MemoryRecord.owner_user_id == row.owner_user_id,
+        MemoryRecord.org_id == row.org_id, MemoryRecord.scope == row.scope,
+        MemoryRecord.revision == expected_revision,
+    ).returning(MemoryRecord.id))
+    if deleted_id is None:
+        await session.rollback()
+        raise HTTPException(409, "memory changed; reload before deleting")
     await session.commit()
     return {"ok": True}
 
 
 async def archive(session: AsyncSession, client, rid: str, archived: bool = True) -> dict:
     row = await get(session, client, rid)
-    row.archived = bool(archived)
-    row.revision += 1
-    row.updated_at = datetime.now(timezone.utc)
+    updated = await session.scalar(
+        update(MemoryRecord)
+        .where(MemoryRecord.id == row.id, MemoryRecord.owner_user_id == row.owner_user_id,
+               MemoryRecord.org_id == row.org_id, MemoryRecord.scope == row.scope,
+               MemoryRecord.revision == row.revision)
+        .values(archived=bool(archived), revision=MemoryRecord.revision + 1,
+                updated_at=datetime.now(timezone.utc))
+        .returning(MemoryRecord).execution_options(populate_existing=True))
+    if updated is None:
+        await session.rollback()
+        raise HTTPException(409, "请刷新后重试")
+    # A later restore can commit before this request sends its response.
+    item = view(updated, True)
     await session.commit()
-    await session.refresh(row)
-    return {"ok": True, "item": view(row, True)}
+    return {"ok": True, "item": item}
 
 
 async def context(session: AsyncSession, client, scopes: list[dict] | None = None, ids: list[str] | None = None) -> dict:
@@ -516,7 +535,7 @@ async def org_create(session: AsyncSession, user: models.User, body: dict) -> di
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(409, "organization memory changed; reload before editing") from exc
+        raise HTTPException(409, "组织记忆已变更，请重新加载后编辑") from exc
     await session.refresh(row)
     return {"ok": True, "updated": False, "item": _admin_view(row)}
 

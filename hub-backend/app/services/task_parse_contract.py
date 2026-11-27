@@ -96,25 +96,50 @@ def _apply_scene(
 
 
 def _extract_json(s: str) -> dict:
-    """Parse the first JSON object from output that may contain Markdown fences or surrounding
-    prose.
+    """Parse the first complete top-level object without promoting nested objects from
+    an incomplete or malformed response.
     """
     import json
-    import re
     text = (s or "").strip()
     decoder = json.JSONDecoder()
-    for match in re.finditer(r"\{", text):
-        try:
-            value, _ = decoder.raw_decode(text, match.start())
-        except (ValueError, RecursionError):
+    start = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if start is None:
+            if char == "{":
+                start = index
+                depth = 1
             continue
-        if isinstance(value, dict):
-            return value
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value, _ = decoder.raw_decode(text, start)
+                except (ValueError, RecursionError):
+                    start = None
+                    continue
+                if isinstance(value, dict):
+                    return value
+                start = None
     return {}
 
 
 def _sanitize_parsed(d: dict) -> dict:
     """Allow known fields only and validate enums and dates before updating forms."""
+    from datetime import date, datetime
     import re
     out: dict = {}
     if not isinstance(d, dict):
@@ -152,12 +177,21 @@ def _sanitize_parsed(d: dict) -> dict:
     for k in ("start", "due"):
         v = str(d.get(k) or "").strip()
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            try:
+                date.fromisoformat(v)
+            except ValueError:
+                continue
             out[k] = v
     if (rec := str(d.get("recur") or "").lower()) in ("daily", "weekly", "monthly"):
         out["recur"] = rec
     rem = str(d.get("remind") or "").strip().replace(" ", "T")
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", rem):
-        out["remind"] = rem
+        try:
+            datetime.fromisoformat(rem)
+        except ValueError:
+            pass
+        else:
+            out["remind"] = rem
     if isinstance(d.get("tags"), list):
         tt = [str(t).strip()[:16] for t in d["tags"] if str(t).strip()][:6]
         if tt:

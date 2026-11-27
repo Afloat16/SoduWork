@@ -18,8 +18,8 @@ Your first run has four steps: install the prerequisites, extract the source, st
    | macOS | Double-click `start-desktop.command` |
    | Linux desktop | Open a terminal in this folder and run `sh start.sh --desktop` |
 
-4. On first run, choose your own password for **`admin`**, using **12–128 characters**, then confirm it. Typing is hidden: no characters or asterisks appear. Press Enter after typing. A mistake prompts you to try again without closing the window. Later starts keep the existing password.
-5. Keep the window open. The launcher installs dependencies, builds the management UI, prepares the database, and opens the client. Initial downloads can take several minutes. Long steps print a status message about every 15 seconds; the printed `startup.log` path contains the details.
+4. Keep the window open while the launcher installs dependencies, builds the management UI, and prepares the desktop runtime. Initial downloads can take several minutes. Long steps print a status message about every 15 seconds. If preparation fails, check the printed `startup.log` path, fix the error, and rerun the same command.
+5. After preparation succeeds, choose a **12–128 character** password for **`admin`** and confirm it. Typing is hidden. Press Enter after each entry. A mistake prompts you to try again. The launcher initializes the database and opens the client. Once the account is created, later starts use the same password.
 
 You do not need to create a database, install Docker or Git, prepare an `.env` file, or install each project separately. First-time setup needs internet access; later starts reuse completed work.
 
@@ -90,9 +90,11 @@ Some older records identify an account but lack verifiable information about the
 
 ## Start again and stop
 
-- Use the same launcher next time and sign in with the same account. Data and model settings are retained.
-- Press **Ctrl+C** in the startup terminal and wait for shutdown. Closing the desktop window may only minimize it to the tray; choose Quit from the tray to exit the application.
-- Do not launch a second copy. If an instance is already running, use its existing terminal and page.
+- Use the same launcher next time to keep your data and model settings. Select **Remember account** to prefill your account on this device the next time you sign in to the same Hub.
+- Select **Sign in automatically on this device** to resume your session after a normal restart using the device’s encrypted credentials. Your password and verification codes are never saved. After you explicitly sign out, you need to sign in again.
+- Both options start off on a new setup. Devices with credentials saved before the update keep their previous restart behavior until you choose a preference.
+- Closing the workspace window leaves the desktop app running. Click its tray icon or run the same launcher again with `--desktop` and the same data directory to reopen the workspace. To end the local session, choose **Quit SoduWork** from the tray or press **Ctrl+C** in the original startup terminal.
+- For a web-only session, copy the management URL from the original terminal to reopen it in your browser.
 - Before updating source, stop the service and back up the entire data directory and any separate desktop profile. Then update the source and run the same launcher. Do not edit the managed application copy inside the data directory.
 
 ## Troubleshooting
@@ -113,7 +115,9 @@ To check prerequisites without installing anything:
 .\start.cmd --check --desktop
 ```
 
-After the check passes, run `.\start.cmd --desktop` in PowerShell or `start.cmd --desktop` in Command Prompt (CMD). Both terminals are supported; there is no need to avoid CMD.
+`--check` is read-only: it reports prerequisites and path risks without creating test files. Passing it does not guarantee that every installation step will succeed. Then run `.\start.cmd --desktop` in PowerShell or `start.cmd --desktop` in Command Prompt (CMD). Both terminals are supported; there is no need to avoid CMD.
+
+Path diagnostics use Chinese and English. Redirected output keeps its current encoding; characters it cannot represent are escaped so they do not interrupt startup, while the English guidance remains readable.
 
 `sh start.sh --desktop` in Git Bash is not inherently invalid, but it finds Python through `PATH`, unlike the Windows entry point. When the Python launcher `py` is available, `start.cmd` first tries Python 3.12, then `py -3`; it uses `python` from `PATH` only when `py` is absent. Having a supported version such as Python 3.13 installed does not mean both terminals select the same interpreter.
 
@@ -123,6 +127,10 @@ If Python is missing or too old, check `python --version` in the original termin
 & 'C:\Path\To\Python\python.exe' .\start.py --check --desktop
 & 'C:\Path\To\Python\python.exe' .\start.py --desktop
 ```
+
+Microsoft Store Python is a valid interpreter. Windows may redirect its data directory to a deeper physical path. When long paths are needed, startup tests actual file operations before copying source, creating the virtual environment, or installing dependencies. The Windows legacy 260-character path limit does not apply to macOS or Linux.
+
+If startup reports that long paths are unavailable, enable **Win32 long paths** in Windows and reopen the launcher so it uses a new process. The launcher does not change this system setting. Keep existing data in its original directory. A short `--data-dir` is an option for a **new, separate instance**; it does not migrate existing accounts or data.
 
 ### macOS launcher permissions
 
@@ -143,7 +151,7 @@ Hidden input is normal: no characters or asterisks appear. Press Enter when done
 
 An uninitialized instance needs an administrator password. By default, Python must recognize standard input as an interactive terminal (TTY). A visible Git Bash window does not guarantee that native Windows Python recognizes it as a TTY; pipes, redirection, or some integrated terminals can also trigger this check. This is different from hidden password input.
 
-First try the Windows entry point from the source directory in an interactive native PowerShell or CMD window, without a pipe or input redirection. For automation or intentional non-interactive input, explicitly add `--password-stdin` and supply the initial password through protected standard input. This flag does not generate a password or reset an existing one. Do not put passwords in command arguments, scripts, or logs. Keep the existing data directory; deleting the database is unnecessary.
+First try the Windows entry point from the source directory in an interactive native PowerShell or CMD window, without a pipe or input redirection. For automation or intentional non-interactive input, explicitly add `--password-stdin` and supply the initial password through protected standard input. This flag does not generate a password or reset an existing one. Do not put passwords in command arguments, scripts, or logs. Keep the existing data directory; deleting the database is unnecessary. For initial setup where dependency downloads take several minutes, automation scripts should preferably run `--prepare-only` first, then start with `--password-stdin` using the same data directory and desktop options to prevent piped input from timing out during downloads.
 
 ### Downloads are slow or setup fails
 
@@ -194,6 +202,8 @@ sh start.sh --desktop
 When `HTTP_PROXY` or `HTTPS_PROXY` is present, the launcher automatically enables `ELECTRON_GET_USE_PROXY` for the Electron install subprocess. An existing explicit setting is preserved; `0`, `false`, `no`, `off`, or an empty value disables automatic proxy activation for Electron. Node download scripts read the proxy settings and `NO_PROXY` per request and work with the required Node.js 22.19+ without raising the minimum version. `ELECTRON_GET_USE_PROXY` controls Electron only, not PortableGit downloads.
 
 #### Windows PortableGit mirrors and offline archives
+
+A slow first download can take more than five minutes. Each additional 64 KiB of the expected archive renews the five-minute timeout. If the server sends no data for 60 seconds, the transfer times out. You can check the byte count in `startup.log`.
 
 PortableGit downloads from the official Git for Windows release by default. To use a mirror, set `SODUWORK_PORTABLE_GIT_MIRROR` to its root URL. It must serve `<mirrorRoot>/v2.55.0.windows.4/<original-official-filename>`. The x64 filename is `PortableGit-2.55.0.4-64-bit.7z.exe`; arm64 uses `PortableGit-2.55.0.4-arm64.7z.exe`. Confirm that your mirror provides the pinned version and target architecture; no default PortableGit mirror is configured.
 
@@ -261,9 +271,11 @@ Check `desktop.log` in the same data directory. Resolve Electron download proble
 
 ### Linux installation and secure sign-in
 
-Install `.deb` or `.rpm` packages through your distribution's software installer, or use `apt install ./package.deb` / `dnf install ./package.rpm`, so the package manager resolves dependencies. Packages declare D-Bus, libsecret, and alternative GNOME Keyring / KWallet service dependencies. An existing matching service satisfies the dependency without replacing the user's keyring. The `tar.gz` and source modes do not manage system dependencies; launch them from a graphical desktop session with these services configured.
+Install `.deb` or `.rpm` packages through your distribution's software installer, or use `apt install ./package.deb` / `dnf install ./package.rpm`, so the package manager resolves dependencies. Packages declare D-Bus, libsecret, and alternative GNOME Keyring / KWallet service dependencies. An existing matching service satisfies the dependency without replacing the user's keyring. The `tar.gz` and source modes do not manage system dependencies; launch them from a graphical desktop session.
 
 Start the application as the ordinary user logged into that desktop. First access may show the system's keyring creation or unlock dialog; use a protected keyring. Do not choose an empty password or disable the sandbox to bypass startup errors. If the keyring is locked or its service is temporarily unavailable, preserve the existing device credentials, restore the system service, then fully quit and reopen the application. Do not delete `device-auth.json`, remove keyring items, or convert credentials to plaintext.
+
+On a profile without existing device credentials, if the system keyring is unavailable, SoduWork offers an encrypted local vault for device sign-in. Choose a separate passphrase of 12–256 characters and keep it safe. You will need it every time you start the desktop, including after installing a keyring. The passphrase stays on this computer and cannot be recovered through the Hub. After unlock, if the system keyring is usable, existing local service credentials from the desktop **My models** panel, plus local agent default models and automation model selections in the same desktop profile, continue to be read and written with that keyring and are not rewritten into vault format. The unlocked vault encrypts those records only when the system keyring is unavailable or is `basic_text`. An existing `device-vault-v1` file is not reset. Without this vault, those local model records continue to use only the system keyring. Application credentials, Feishu connections, plugin publishing keys, and cloud computer credentials still need the system keyring.
 
 The source launcher's Linux desktop mode rejects root users (including launches through `sudo`) before creating instance data or installing dependencies. This check also applies to `--check --desktop` and `--prepare-only --desktop`. Run `sh start.sh --desktop` in an ordinary user's graphical session; use `sh start.sh` for a headless server.
 
@@ -298,7 +310,7 @@ Run these from the source root. The table uses the macOS/Linux wrapper. Windows 
 | Do not open a browser automatically | `sh start.sh --desktop --no-browser` |
 | Use a dedicated data directory | `sh start.sh --desktop --data-dir "D:/SoduWork-data"` |
 
-Use the same data directory for preparation and startup. Automation may explicitly use `--password-stdin` for the first password; never put passwords in command arguments or scripts. On Windows, set `SODUWORK_NO_PAUSE=1` to return a failing exit code without waiting for a keypress.
+Use the same data directory for preparation and startup. With `--password-stdin`, the launcher reads the first password only after preparation succeeds. Keep passwords out of command arguments and scripts. On Windows this mode returns immediately on failure. For other unattended invocations, set `SODUWORK_NO_PAUSE=1` to skip the keypress on failure.
 
 For independent source development, see the [developer guide](development.en.md). The Vite proxy defaults to `http://127.0.0.1:9080`; set `SODUWORK_DEV_HUB=http://127.0.0.1:18989` when using this launcher. The default service is accessible only on this computer. For team deployment, see [Docker self-hosting](../ops/self-host/README.md).
 
@@ -321,6 +333,8 @@ On Windows, an empty or relative `LOCALAPPDATA` counts as unset and falls back t
 On Linux, an unset, empty, or relative `XDG_DATA_HOME` falls back to `~/.local/share`. Absolute values, including paths with spaces, are preserved. An explicit `--data-dir` takes precedence. Existing data is not moved; use its absolute path with `--data-dir` if it was previously stored under a relative XDG directory. The source-directory safety check still applies.
 
 The directory contains the database, attachments, service signing key, logs, and reusable dependencies. The desktop profile normally lives in `desktop-profile/` inside this directory. On macOS, data directories inside `~/Library/Application Support/SoduWork` or `soduwork` use separate desktop profiles under `~/Library/Application Support/SoduWork Development/`, outside the installed client profile. The default retains `source-service-desktop`; custom directories use `source-service-desktop-<directory-id>`, derived from the full data path. If that profile does not exist, a safe existing development profile at `source-service-desktops/<directory-id>/` is reused. When both exist, the standard profile takes precedence. Hub data and accounts stay in place; profile files are never moved or merged. Unsafe output links into installed profiles are rejected before writing files. `--check --desktop` prints the selected desktop profile without creating it. Treat the data directory and desktop profile as private. Never commit it or include it in a source archive. The launcher does not inherit the checkout's `.env`, production database settings, or model credentials.
+
+Before upgrading an older Hub, make sure you can sign in with an administrator account whose password has 8–128 characters and includes a non-whitespace character. Reset older passwords that do not meet these requirements before upgrading, especially if the Hub has only one administrator. Users with a verified email address can also use the password reset flow. The launcher requires 12–128 characters when setting the initial administrator password.
 
 Before updating source, stop the service and back up the entire data directory and any separate desktop profile. Then update the source and run the same launcher again. To roll back, restore the matching source version and data backup together. Do not delete a database to reset a forgotten password.
 

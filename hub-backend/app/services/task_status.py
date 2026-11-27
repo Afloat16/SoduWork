@@ -39,6 +39,19 @@ async def mark(session: AsyncSession, task: models.Task, status: str, *,
     """
     if task is None or status not in VALID:
         return False
+    # #631: done任务不可修改状态
+    # #663: 撤回验收时重置done状态（仅引擎允许）
+    # Allow done->todo for re-opening requirements.
+    if task.status == "done" and status != task.status:
+        if not engine and status != "todo":
+            return False
+    # #698, #699, #700: 已取消任务不可重新规划/执行/提交
+    # Allow cancel->todo for restore; block cancel->doing/planning.
+    if task.status == "cancel" and status == "doing":
+        return False
+    # #672: done需求不可重新开工（引擎也不允许done->doing）
+    if task.status == "done" and status == "doing":
+        return False
     if status == "doing" and getattr(task, "archived_at", None):
         return False
     if task.status == status and status != "done":
@@ -63,7 +76,20 @@ async def mark(session: AsyncSession, task: models.Task, status: str, *,
     task.status = status
     from . import tasks as tsvc
     tsvc.stamp_actual(task, prev, status)
+    if prev == "done":
+        from . import task_events
+        task_events.record(session, task.id, "status.reset_from_done",
+                           {"from": "done", "to": status, "reason": why or "撤回验收"}, actor="SoduWork")
     if status == "done":
+        from . import receipts
+        # Direct post-commit dispatch and queued dispatch must identify the same
+        # transition even if the requirement is reopened before they run.
+        snapshot = receipts.completion_snapshot(task)
+        if snapshot:
+            identity, closed_at, marker = await receipts.completion_identity(session, task.id)
+            task._close_receipt = (identity, closed_at, marker, snapshot)
+        else:
+            task._close_receipt = None
         await _close_batch_members(session, task, engine=engine)
         from . import project_context
         await project_context.accept_task_capsules(session, task)
@@ -116,10 +142,16 @@ async def _close_batch_members(session: AsyncSession, batch: models.Task, *,
     src_ids = [x for x in src_ids if x and x != batch.id]
     if not src_ids:
         return
-    from . import task_events
-    for sid in src_ids:
-        t = await session.get(models.Task, sid)
-        if t is None or t.status in ("done", "cancel"):
+    from . import task_events, task_requirements
+    for sid in sorted(set(src_ids)):
+        t = await session.get(models.Task, sid, with_for_update=True, populate_existing=True)
+        if (t is None or t.status in ("done", "cancel") or t.owner_client_id != batch.owner_client_id
+                or t.owner_user_id != batch.owner_user_id):
+            continue
+        try:
+            task_requirements.ensure_executable(t)
+        except ValueError:
+            # A source may have been archived or returned to triage after admission.
             continue
         # The batch shell owns the one reviewed delivery for all source items. Requiring every
         # imported bug to manufacture a second artifact would leave them permanently open.

@@ -1,7 +1,7 @@
 """Decode complete model JSON objects without swallowing surrounding prose."""
 import unittest
 
-from app.services.task_parse_contract import _extract_json
+from app.services.task_parse_contract import _extract_json, _sanitize_parsed
 
 
 class TaskJsonTests(unittest.TestCase):
@@ -29,6 +29,35 @@ class TaskJsonTests(unittest.TestCase):
         for value in ("", "No fields", '{"title":', "[1,2]", None):
             with self.subTest(value=value):
                 self.assertEqual(_extract_json(value), {})
+
+
+    def test_truncated_outer_response_does_not_promote_an_example(self):
+        text = '{"note":"Unfinished","example":{"title":"Nested example","priority":"low"}'
+        self.assertEqual(_extract_json(text), {})
+        self.assertEqual(_sanitize_parsed(_extract_json(text)), {})
+
+    def test_truncated_nested_containers_do_not_supply_draft_fields(self):
+        import json
+        complete = json.dumps({
+            "note": 'Use } and "quoted" text',
+            "example": {"items": [{"title": "Nested example", "priority": "low"}]},
+        })
+        for end in range(len(complete)):
+            with self.subTest(end=end):
+                self.assertEqual(_extract_json(complete[:end]), {})
+        self.assertEqual(_extract_json(complete), json.loads(complete))
+
+    def test_malformed_outer_response_does_not_promote_an_example(self):
+        text = '{"note":invalid,"example":{"title":"Nested example","priority":"low"}}'
+        self.assertEqual(_extract_json(text), {})
+
+    def test_valid_top_level_draft_after_a_malformed_object_is_preserved(self):
+        text = '{"note":invalid,"example":{"title":"Nested example"}}\n{"title":"Ship"}'
+        self.assertEqual(_extract_json(text), {"title": "Ship"})
+
+    def test_first_complete_draft_is_kept_before_an_incomplete_example(self):
+        text = '{"title":"Ship","priority":"high"}\n{"note":"Unfinished","example":{"title":"Nested"}'
+        self.assertEqual(_extract_json(text), {"title": "Ship", "priority": "high"})
 
 
 if __name__ == "__main__":

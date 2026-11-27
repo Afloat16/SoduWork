@@ -266,7 +266,25 @@ test('remembered account is saved before interactive login is announced and surv
   assert.equal(saved.length, 1);
   assert.equal(saved[0][1], 'Employee.Example');
   assert.equal(JSON.stringify(saved).includes('never-persist-password'), false);
-  assert.equal(f.events.find(event => event.type === 'soduwork-device-auth').detail.interactiveLogin, true);
+  assert.equal(f.events.find(event => event.type === 'soduwork-device-auth' && event.detail.state === 'active').detail.interactiveLogin, true);
+});
+
+test('remembering an account is independent of auto sign-in and an opt-out survives bootstrap', async () => {
+  const result = signedIn('fixture-session');
+  const f = runtime(result);
+  assert.equal(f.api.loginPreferences().rememberAccount, false);
+  let nativeAutoLogin;
+  f.bridge.deviceAuthLogin = async payload => { nativeAutoLogin = payload.autoLogin; return result; };
+  await f.api.clientLogin({account: 'employee', rememberAccount: true, autoLogin: false});
+  assert.equal(nativeAutoLogin, false);
+  assert.equal(f.api.loginPreferences().rememberAccount, true);
+  await f.api.clientAccountAction('emailCode', {email: 'employee@example.test', rememberAccount: false, autoLogin: true});
+  assert.equal(f.accountRequests.at(-1).autoLogin, true);
+  const reopened = runtime(result, {values: f.values});
+  reopened.bridge.deviceAuthBootstrap = async () => ({...result, user: {id: 'employee', email: 'employee@example.test'}});
+  await reopened.api.registerClient();
+  assert.equal(reopened.api.rememberedLoginAccount(), '');
+  assert.equal(reopened.api.loginPreferences().rememberAccount, false);
 });
 
 for (const action of ['password', 'emailCode', 'register']) test(action + ' remembers only the successful explicit account identifier', async () => {
@@ -277,7 +295,7 @@ for (const action of ['password', 'emailCode', 'register']) test(action + ' reme
   const values = [...f.values].filter(([key]) => key.startsWith('soduwork_work_last_login_account_v1@'));
   assert.equal(values.length, 1);
   assert.equal(values[0][1], 'User@Example.test');
-  assert.equal(f.events.find(event => event.type === 'soduwork-device-auth').detail.interactiveLogin, true);
+  assert.equal(f.events.find(event => event.type === 'soduwork-device-auth' && event.detail.state === 'active').detail.interactiveLogin, true);
   f.login({ ok: false, status: 401, code: 'ACCOUNT_OR_PASSWORD_INVALID' });
   await f.api.clientAccountAction(action, { email: 'failed@example.test', password: 'private-fixture-password' });
   assert.equal(f.api.rememberedLoginAccount(), 'User@Example.test');
@@ -314,7 +332,7 @@ for (const [label, user, expected] of [
   assert.equal(result.ok, true);
   assert.equal(observed, expected);
   assert.equal(f.api.rememberedLoginAccount(), expected);
-  assert.equal(f.events.find(event => event.type === 'soduwork-device-auth').detail.interactiveLogin, undefined);
+  assert.equal(f.events.find(event => event.type === 'soduwork-device-auth' && event.detail.state === 'active').detail.interactiveLogin, undefined);
   const reopened = runtime(signedIn('unused-login-session'), {values: f.values});
   assert.equal(reopened.api.rememberedLoginAccount(), expected);
 });

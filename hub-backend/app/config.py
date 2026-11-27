@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     # Independently provisioned PostgreSQL database, never the Hub business DB.
     # Empty disables cloud app storage without affecting standalone apps.
     jiyong_database_url: str = ""
+    # Cloud app assets use an S3-compatible object store such as Tencent COS.
+    # Credentials stay server-side and are never exposed to app pages.
+    jiyong_object_endpoint: str = ""
+    jiyong_object_access_key: str = ""
+    jiyong_object_secret_key: str = ""
+    jiyong_object_bucket: str = ""
+    jiyong_object_region: str = ""
+    jiyong_object_secure: bool = True
+    jiyong_object_prefix: str = "soduwork/jiyong"
     jiyong_asset_dir: str = ""
     jiyong_max_spaces_per_user: int = Field(default=100, ge=1, le=10000)
     jiyong_max_records_per_space: int = Field(default=100000, ge=1)
@@ -80,8 +89,12 @@ class Settings(BaseSettings):
     # Full-client updates.
     # Store installers under hub-backend/client-releases by default, optionally on a separate persistent volume.
     client_update_dir: str = ""
-    # Base64-encoded 32-byte Ed25519 private key for local publication compatibility.
-    # Prefer a restricted CLIENT_UPDATE_SIGNING_KEY_FILE mount so the long-lived Hub need not hold signing authority.
+    # Optional environment-owned signing authority for installer-only admin uploads.
+    # Mount a restricted file containing a Base64 Ed25519 seed; never return it via APIs.
+    client_update_signing_key_file: str = Field(default="", repr=False)
+    client_update_signing_key_id: str = ""
+    # Empty discovers an installed 7zz/7z; this is an executable path, not a command.
+    client_update_archive_tool: str = ""
     # JSON object of trusted Ed25519 public keys. The checked-in trust file is
     # used when this is empty; an environment override supports controlled key rotation.
     client_update_public_keys: str = ""
@@ -140,6 +153,9 @@ class Settings(BaseSettings):
     minio_bucket: str = "file-storage"
     minio_secure: bool = True         # https
     attach_max_mb: int = 20           # Maximum size per file in MB.
+    attach_owner_quota_bytes: int | None = Field(default=None, ge=0)
+    attach_org_quota_bytes: int | None = Field(default=None, ge=0)
+    artifact_staging_dir: str = ""
     # Independent document-library storage.
     # local is the default; remote selects the first fully configured protocol; auto falls back to local when none is configured.
     # Existing files retain their recorded backend; all backends isolate object keys by user hash.

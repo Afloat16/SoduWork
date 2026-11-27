@@ -49,6 +49,26 @@ if (typeof electron === 'string') {
   }
   const call = (name, ...args) => js(`SoduWorkAPI[${JSON.stringify(name)}](...${JSON.stringify(args)})`);
   const click = selector => js(`document.querySelector(${JSON.stringify(selector)}).click();void 0;`);
+  async function nativeClick(selector) {
+    const point = await js(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!element) throw Error('Missing control: ' + ${JSON.stringify(selector)});
+      element.scrollIntoView({ block: 'nearest' });
+      const box = element.getBoundingClientRect();
+      if (!box.width || !box.height) throw Error('Hidden control');
+      const point = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+      if (!element.contains(document.elementFromPoint(point.x, point.y))) throw Error('Obscured control');
+      return point;
+    })()`);
+    for (const type of ['mouseDown', 'mouseUp']) win.webContents.sendInputEvent({ type, button: 'left', clickCount: 1, ...point });
+    await delay(30);
+  }
+  async function nativeEnter(selector, value) {
+    await nativeClick(selector); win.webContents.selectAll();
+    await until(`(() => { const input = document.querySelector(${JSON.stringify(selector)});
+      return input === document.activeElement && input.selectionStart === 0 && input.selectionEnd === input.value.length; })()`);
+    await win.webContents.insertText(value);
+  }
   const identity = () => ({ ok: true, stored: true, clientId: 'fixture-device-' + account,
     user: { id: 'fixture-user-' + account, displayName: 'Isolated fixture' }, session: 'fixture-session-' + account, expiresIn: 3600 });
   function filesBelow(directory) {
@@ -320,10 +340,90 @@ if (typeof electron === 'string') {
     assert.equal(await js('document.querySelector("[data-library-create-kind=document]")'), null);
     assert.ok(await js('document.querySelector("[data-library-filter-kind=document]") !== null'));
     report.cases.push('Actual native upload renames duplicate files, preserves both versions and completes the batch; document creation is absent while existing documents remain filterable');
+    const legacyBytes = Buffer.from('%PDF-1.4\nIsolated filename repair fixture\n');
+    const legacy = (await js(`SoduWorkAPI.uploadLibraryFile(new File([Uint8Array.from(atob(${JSON.stringify(legacyBytes.toString('base64'))}), c => c.charCodeAt(0))],
+      'legacy-import.p', { type: 'application/pdf' }), '', 'local', ${JSON.stringify(sourceMetadata)})`)).item;
+    // Recreate an old truncated name in this isolated account, including its real object.
+    const legacyFilename = 'r'.repeat(158) + '.p', legacyIndexPath = path.join(storageRoot, 'index.json');
+    const legacyIndex = JSON.parse(fs.readFileSync(legacyIndexPath, 'utf8'));
+    const legacyRow = legacyIndex.items.find(row => row.id === legacy.id);
+    const oldObject = path.join(storageRoot, legacyRow._object);
+    const legacyObject = path.join(path.dirname(oldObject), legacyFilename);
+    fs.renameSync(oldObject, legacyObject);
+    legacyRow.filename = legacyRow.title = legacyFilename;
+    legacyRow._object = path.posix.join(path.posix.dirname(legacyRow._object), legacyFilename);
+    fs.writeFileSync(legacyIndexPath, JSON.stringify(legacyIndex));
+    await loadPanel();
+    await until(`document.querySelector('[data-library-rename="${legacy.id}"]')`);
+    for (const view of ['grid', 'list']) {
+      await nativeClick(`[data-library-view="${view}"]`);
+      await until(`document.querySelector('[data-library-content]').classList.contains('is-${view}')`);
+      assert.equal(await js('document.querySelector("[data-library-repair-filename],.library-filename-hint")'), null);
+    }
+    const openRename = async () => {
+      await nativeClick(`[data-library-menu-toggle="item-${legacy.id}"]`);
+      await nativeClick(`[data-library-rename="${legacy.id}"]`);
+      await until('document.querySelector(".library-folder-dialog[open]")');
+    };
+    await openRename();
+    assert.equal(await js('document.querySelector("[data-library-folder-name]").value'), legacyFilename);
+    await nativeEnter('[data-library-folder-name]', 'recovered-report.pdf');
+    await nativeClick('.library-folder-editor-foot [data-library-folder-cancel]');
+    assert.equal((await listLocal()).items.find(row => row.id === legacy.id).filename, legacyFilename);
+    assert.equal(sha(await readBytes(legacy.id)), sha(legacyBytes));
+    report.cases.push('The original menu is preserved in list and grid, and cancelling Rename preserves the legacy filename and exact bytes');
+
+    await openRename(); await nativeEnter('[data-library-folder-name]', 'recovered-report.pdf');
+    await nativeClick('.library-folder-editor-save');
+    await until(`document.querySelector('[data-library-file-preview="${legacy.id}"]')?.textContent.includes('recovered-report.pdf') && !document.querySelector('.library-folder-dialog')`);
+    const repaired = (await listLocal()).items.find(row => row.id === legacy.id);
+    assert.equal(repaired.filename, 'recovered-report.pdf'); assert.equal(repaired.title, 'recovered-report.pdf');
+    assert.equal(repaired.sessionId, legacy.sessionId); assert.equal(repaired.conversationTitle, legacy.conversationTitle);
+    assert.equal(repaired.contentType, legacy.contentType); assert.equal(repaired.size, legacy.size);
+    assert.equal(repaired.filenameIssue, undefined); assert.equal(sha(await readBytes(legacy.id)), sha(legacyBytes));
+    const repairedIndex = JSON.parse(fs.readFileSync(legacyIndexPath, 'utf8')).items.find(row => row.id === legacy.id);
+    assert.equal(path.basename(repairedIndex._object), 'recovered-report.pdf');
+    assert.equal(sha(fs.readFileSync(path.join(storageRoot, repairedIndex._object))), sha(legacyBytes));
+    assert.equal(fs.existsSync(legacyObject), false);
+    report.cases.push('The original Rename dialog crosses production API/preload/IPC and changes a truncated .p to the explicit .pdf, retaining ID, history metadata and bytes on disk');
+
+    await nativeClick(`[data-library-menu-toggle="item-${legacy.id}"]`);
+    await nativeClick(`[data-library-rename="${legacy.id}"]`);
+    await until('document.querySelector(".library-folder-dialog[open]")');
+    await nativeEnter('[data-library-folder-name]', 'Ordinary rename'); await nativeClick('.library-folder-editor-save');
+    await until(`document.querySelector('[data-library-file-preview="${legacy.id}"]')?.textContent.includes('Ordinary rename.pdf')`);
+    assert.equal((await listLocal()).items.find(row => row.id === legacy.id).filename, 'Ordinary rename.pdf');
+    assert.equal(sha(await readBytes(legacy.id)), sha(legacyBytes));
+    report.cases.push('Ordinary rename still updates the title and preserves the repaired extension instead of using the full-filename operation');
+
+    const separateTitleIndex = JSON.parse(fs.readFileSync(legacyIndexPath, 'utf8'));
+    separateTitleIndex.items.find(row => row.id === legacy.id).title = 'Legacy display title';
+    fs.writeFileSync(legacyIndexPath, JSON.stringify(separateTitleIndex));
+    await loadPanel();
+    await until(`document.querySelector('[data-library-file-preview="${legacy.id}"]')?.textContent.includes('Legacy display title.pdf')`);
+    await openRename();
+    assert.equal(await js('document.querySelector("[data-library-folder-name]").value'), 'Legacy display title.pdf');
+    await nativeEnter('[data-library-folder-name]', 'Ordinary rename.pdf'); await nativeClick('.library-folder-editor-save');
+    await until(`document.querySelector('[data-library-file-preview="${legacy.id}"]')?.textContent.includes('Ordinary rename.pdf')`);
+    assert.equal((await listLocal()).items.find(row => row.id === legacy.id).title, 'Ordinary rename.pdf');
+    assert.equal(sha(await readBytes(legacy.id)), sha(legacyBytes));
+    report.cases.push('Rename can align a separately stored title with its filename without changing its bytes');
+
+    await openRename(); await nativeEnter('[data-library-folder-name]', 'must-not-save.txt');
+    await call('clientLogin', { account: 'b' });
+    await until('!document.querySelector(".library-folder-dialog")');
+    assert.equal((await listLocal()).items.length, 0);
+    await call('clientLogin', { account: 'a' });
+    assert.equal((await listLocal()).items.find(row => row.id === legacy.id).filename, 'Ordinary rename.pdf');
+    assert.equal(sha(await readBytes(legacy.id)), sha(legacyBytes));
+    await loadPanel();
+    report.cases.push('Switching accounts closes a pending rename without mutating either account');
     report.cases.push('Historical Hub-local fixture rows never appear in the client-local tab');
+    await until('!document.querySelector("[data-library-storage=remote]").disabled');
     await click('[data-library-storage=remote]');
     await click('[data-library-scope=all]');
     await until('document.querySelector("[data-library-folder=server-history-root]")');
+    assert.equal(await js('document.querySelector("[data-library-repair-filename]")'), null, 'Remote files must not offer local filename repair');
     assert.equal(await js('document.querySelector("[data-library-menu-toggle=folder-server-history-root]")'), null);
     await click('[data-library-folder=server-history-root]');
     await until('document.querySelector("[data-library-file-preview=fixture-server-history]")');
@@ -331,6 +431,7 @@ if (typeof electron === 'string') {
     assert.equal(await js('document.querySelector("[data-library-create-kind=upload]").disabled'), true);
     assert.equal(await js('document.querySelector("[data-library-migrate=fixture-server-history]")'), null);
     assert.equal(await js('document.querySelector("[data-library-move=fixture-server-history]")'), null);
+    assert.equal(await js('document.querySelector("[data-library-repair-filename=fixture-server-history]")'), null);
     report.cases.push('The historical server folder is read-only for creation/upload and its legacy local rows never offer client-copy or move');
 
     async function trashHistoryFile() {

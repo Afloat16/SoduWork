@@ -235,7 +235,20 @@
       } else render();
       return;
     }
-    if (d.libraryFolder !== undefined) { previewPane?.close(); state.folder = state.folders.find(row => row.id === d.libraryFolder) || null; state.storage = storedBackend(state.folder); state.folderId = d.libraryFolder; state.scope = 'all'; state.selected.clear(); state.selectedFolders.clear(); load(); return; }
+    if (d.libraryFolder !== undefined) {
+      previewPane?.close();
+      state.folder = state.folders.find(row => row.id === d.libraryFolder) || null;
+      state.storage = storedBackend(state.folder);
+      state.folderId = d.libraryFolder;
+      state.scope = 'all';
+      state.query = '';
+      root.querySelector('[data-library-search]').value = '';
+      state.filterKind = 'all';
+      state.selected.clear();
+      state.selectedFolders.clear();
+      load();
+      return;
+    }
     if (d.libraryDownload !== undefined) {
       const epoch = lifecycleEpoch;
       closeMenus(); try { await global.SoduWorkAPI.downloadLibraryItem(d.libraryDownload, d.filename); } catch (error) { if (epoch === lifecycleEpoch) await dialogs.showError(error, '下载失败'); } return;
@@ -475,14 +488,16 @@
 
   async function renameItem(button, id) {
     const item = state.items.find(row => row.id === id);
-    if (!item) return;
+    if (!item || button.disabled || state.scope === 'trash') return;
+    const epoch = lifecycleEpoch;
     closeMenus();
     const current = displayName(item);
     const name = await openNameDialog({
       title: '重命名文件', description: '修改资料名称，文件内容不会改变。', label: '文件名称',
       value: current, placeholder: '输入文件名称', confirm: '保存', maxLength: 240,
     });
-    if (!name || name === current) return;
+    if (!name || name === current || epoch !== lifecycleEpoch || state.scope === 'trash' ||
+        !state.items.some(row => row.id === id)) return;
     await runAction(button, () => global.SoduWorkAPI.updateLibraryItem(id, { title: name }), '重命名失败', '已重命名');
   }
   async function renameFolder(button, id) {
@@ -962,9 +977,9 @@
     const breadcrumb = root.querySelector('[data-library-breadcrumb]');
     breadcrumb.hidden = !state.folder || trash;
     breadcrumb.innerHTML = state.folder ? '<button data-library-root>资料库</button><span>/</span><b data-user-content>' + esc(state.folder.name) + '</b>' : '';
-    const query = state.query.toLocaleLowerCase();
+    const query = state.query.trim().normalize('NFC').toLowerCase();
     const showFolders = !trash && ['all', 'folder'].includes(state.filterKind) && ['all', 'folders', 'favorites'].includes(state.scope);
-    const folders = showFolders ? recentFirst(state.folders.filter(folder => !query || folder.name.toLocaleLowerCase().includes(query))) : [];
+    const folders = showFolders ? recentFirst(state.folders.filter(folder => !query || folder.name.normalize('NFC').toLowerCase().includes(query))) : [];
     const items = state.scope === 'folders' || state.filterKind === 'folder' ? [] : recentFirst(state.items.filter(item => {
       if (state.scope === 'images' && !isImageItem(item)) return false;
       if (state.scope === 'favorites' && !item.favorite) return false;

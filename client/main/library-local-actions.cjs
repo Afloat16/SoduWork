@@ -1,6 +1,7 @@
 'use strict';
 const crypto = require('node:crypto');
-const { safeFilename } = require('./attachment-files.js');
+const { safeFilename, canOpenWithSystem } = require('./attachment-files.js');
+const { mimeTypeForFilename } = require('./library-output.cjs');
 const { error, clone, ITEM, FOLDER, MAX_BYTES } = require('./library-local-store.cjs');
 const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 const now = () => new Date().toISOString();
@@ -17,11 +18,84 @@ function item(index, id, deleted = false) {
   if (!row || (!deleted && row.deletedAt)) throw error('LOCAL_LIBRARY_NOT_FOUND', '资料不存在或已在回收站');
   return row;
 }
-function name(value, fallback) { return safeFilename(String(value || '').trim(), fallback).slice(0, 160); }
+function name(value, fallback, marker = '') {
+  const filename = safeFilename(String(value || '').trim(), fallback);
+  if (!marker && filename.length <= 160) return filename;
+  const parts = splitFilename(filename), ending = marker + parts.extension;
+  const extension = ending.length <= 160 && Buffer.byteLength(ending, 'utf8') <= 180 ? parts.extension : '';
+  const suffix = marker + extension;
+  let prefix = '', bytes = Buffer.byteLength(suffix, 'utf8');
+  for (const character of extension ? parts.stem : filename) {
+    const size = Buffer.byteLength(character, 'utf8');
+    if (prefix.length + character.length + suffix.length > 160 || bytes + size > 180) break;
+    prefix += character;
+    bytes += size;
+  }
+  return safeFilename(prefix + suffix, fallback);
+}
 const nameKey = value => String(value || '').normalize('NFC').toLowerCase();
 function visibleFilename(row) {
   const title = name(row.title, row.filename), suffix = row.filename.match(/(\.[^./\\]+)$/)?.[1] || '';
   return name(title.toLowerCase().endsWith(suffix.toLowerCase()) ? title : title + suffix, row.filename);
+}
+function validCompleteFilename(value) {
+  return typeof value === 'string' && !!value && value === value.trim() && value.length <= 160 &&
+    Buffer.byteLength(value, 'utf8') <= 180 && value.isWellFormed() && safeFilename(value, '') === value;
+}
+function knownExtension(filename) {
+  return canOpenWithSystem(filename) ||
+    /\.(pdf|txt|md|markdown|csv|png|jpe?g|gif|webp|svg|bmp|avif|mp3|mp4|wav|webm|json|xml|ya?ml|log|css|js|ts|py|ini|toml|bin)$/i.test(filename);
+}
+function hasLegacySuffix(row) {
+  const filename = row.filename, suffix = splitFilename(filename).extension.toLowerCase();
+  const titleSuffix = splitFilename(row.title || '').extension.toLowerCase();
+  // Older renames could append the already truncated suffix to a full name.
+  if (suffix && titleSuffix !== suffix && titleSuffix.startsWith(suffix) &&
+      nameKey(filename) === nameKey(row.title + suffix)) return true;
+  return filename.length === 160 && !knownExtension(filename);
+}
+
+function completesLegacyFilename(row, wanted) {
+  const newSuffix = splitFilename(wanted).extension.toLowerCase();
+  if (!newSuffix) return false;
+  if (!validCompleteFilename(row.filename)) return true;
+  const oldSuffix = splitFilename(row.filename).extension.toLowerCase();
+  if (newSuffix === oldSuffix || !newSuffix.startsWith(oldSuffix)) return false;
+  const legacySuffix = hasLegacySuffix(row);
+  const mime = String(row.contentType || '').split(';')[0].trim().toLowerCase();
+  if (mime && mime !== 'application/octet-stream') {
+    const newMime = mimeTypeForFilename(wanted);
+    if (mimeTypeForFilename(row.filename) === mime || (newMime && newMime !== mime)) return false;
+    // A .docx truncated to .doc can also survive an old rename as report.docx.doc.
+    if (newMime === mime && (row.filename.length === 160 || legacySuffix)) return true;
+  }
+  return legacySuffix && (!oldSuffix || (!knownExtension(row.filename) && knownExtension(wanted)));
+}
+
+function setCompleteFilename(row, filename) {
+  if (!validCompleteFilename(filename)) throw error('LOCAL_LIBRARY_INVALID', '文件名无效或过长，请缩短名称，不要包含路径。');
+  row.filename = row.title = filename;
+  if (row.kind === 'file') row.kind = classify(filename, row.contentType);
+}
+
+function filenameIssues(index) {
+  // Report legacy damage without changing the index or guessing a lost extension.
+  // Count destinations once, including folders, even when the list is filtered.
+  const counts = new Map(), keys = new Map(), issues = new Map();
+  const key = (folderId, filename) => JSON.stringify([folderId || null, nameKey(filename)]);
+  const add = value => counts.set(value, (counts.get(value) || 0) + 1);
+  for (const row of index.folders) add(key(row.parentId, row.name));
+  for (const row of index.items) if (!row.deletedAt && typeof row.filename === 'string') {
+    const value = key(row.folderId, visibleFilename(row)); keys.set(row.id, value); add(value);
+  }
+  for (const row of index.items) {
+    const filename = row.filename;
+    // Conversation revisions may intentionally share a visible name.
+    if (!row.deletedAt && row.sourceType !== 'conversation' && counts.get(keys.get(row.id)) > 1) issues.set(row.id, 'duplicate');
+    else if (!validCompleteFilename(filename)) issues.set(row.id, 'invalid');
+    else if (hasLegacySuffix(row)) issues.set(row.id, 'check');
+  }
+  return issues;
 }
 function checkItemName(index, row) {
   const key = nameKey(visibleFilename(row));
@@ -36,7 +110,7 @@ function splitFilename(value) {
   return index > 0 ? { stem: name.slice(0, index), extension: name.slice(index) } : { stem: name, extension: '' };
 }
 function nextItemName(index, row) {
-  const desired = visibleFilename(row), parts = splitFilename(desired);
+  const desired = visibleFilename(row);
   const occupied = candidate => {
     const key = nameKey(candidate);
     return index.items.some(other => other.id !== row.id && !other.deletedAt && other.folderId === row.folderId && nameKey(visibleFilename(other)) === key) ||
@@ -44,7 +118,7 @@ function nextItemName(index, row) {
   };
   if (!occupied(desired)) return desired;
   for (let number = 1; number < 100000; number += 1) {
-    const candidate = parts.stem + '（' + number + '）' + parts.extension;
+    const candidate = name(desired, row.filename, '（' + number + '）');
     if (!occupied(candidate)) return candidate;
   }
   throw error('LIBRARY_NAME_CONFLICT', '当前文件夹下可用文件名已耗尽，请整理后重试');
@@ -125,20 +199,23 @@ async function execute(store, index, action, payload) {
   if (action === 'list') {
     const scope = ['all', 'folders', 'favorites', 'images', 'trash', 'recommended'].includes(body.scope) ? body.scope : 'recommended';
     const current = ['all', 'folders'].includes(scope) ? folder(index, body.folderId) : null;
-    const query = String(body.query || '').trim().toLowerCase();
+    const query = nameKey(String(body.query || '').trim());
     const itemCounts = new Map(), childCounts = new Map();
     for (const row of index.items) if (!row.deletedAt) itemCounts.set(row.folderId, (itemCounts.get(row.folderId) || 0) + 1);
     for (const row of index.folders) childCounts.set(row.parentId, (childCounts.get(row.parentId) || 0) + 1);
     const folders = ['all', 'folders', 'favorites'].includes(scope) ? index.folders.filter(x =>
-      (scope === 'favorites' ? x.favorite : x.parentId === (current?.id || null)) && x.name.toLowerCase().includes(query)).map(x => ({ ...publicRow(x),
+      (scope === 'favorites' ? x.favorite : x.parentId === (current?.id || null)) && nameKey(x.name).includes(query)).map(x => ({ ...publicRow(x),
         itemCount: itemCounts.get(x.id) || 0,
         childCount: childCounts.get(x.id) || 0 })).sort((a, b) => a.name.localeCompare(b.name)) : [];
     let items = scope === 'folders' ? [] : index.items.filter(x => Boolean(x.deletedAt) === (scope === 'trash') &&
       (!['all', 'folders'].includes(scope) || x.folderId === (current?.id || null)) &&
       (scope !== 'favorites' || x.favorite) && (scope !== 'images' || x.kind === 'image') &&
-      (!query || (x.title + ' ' + x.filename).toLowerCase().includes(query)));
+      (!query || nameKey(x.title + ' ' + x.filename).includes(query)));
     items = items.sort((a, b) => ['recommended', 'images', 'trash'].includes(scope) ? String(b.deletedAt || b.updatedAt).localeCompare(a.deletedAt || a.updatedAt) : a.title.localeCompare(b.title));
-    return { ok: true, scope, storage: 'local', folder: current ? publicRow(current) : null, folders, items: items.map(publicRow), trashCount: index.items.filter(x => x.deletedAt).length };
+    const issues = items.length ? filenameIssues(index) : new Map();
+    return { ok: true, scope, storage: 'local', folder: current ? publicRow(current) : null, folders,
+      items: items.map(row => ({ ...publicRow(row), ...(issues.has(row.id) ? { filenameIssue: issues.get(row.id) } : {}) })),
+      trashCount: index.items.filter(x => x.deletedAt).length };
   }
   if (action === 'createFolder' || action === 'updateFolder') {
     const row = action === 'createFolder' ? { id: 'local-folder-' + crypto.randomUUID(), parentId: folder(index, body.parentId)?.id || null,
@@ -245,13 +322,28 @@ async function execute(store, index, action, payload) {
     // Conversation revisions intentionally keep independent same-name versions.
     if (row.sourceType !== 'conversation') checkItemName(index, row);
   } else if (action === 'associateSource') Object.assign(row, source(body));
+  else if (action === 'repairFilename') {
+    const old = row._object, previousFilename = row.filename;
+    setCompleteFilename(row, body.filename);
+    checkItemName(index, row);
+    if (row.filename !== previousFilename) {
+      // Use the same staged-copy commit as a normal rename; never edit source bytes.
+      row._object = await store.write(await store.read(row), row.filename, index);
+      index.garbage.push(old);
+    }
+  }
   else if (action === 'updateItem') {
     let filenameChanged = false;
     if (has(body, 'folderId')) row.folderId = folder(index, body.folderId)?.id || null;
     if (has(body, 'title')) {
       const previousFilename = row.filename;
-      row.title = name(body.title, row.title);
-      row.filename = visibleFilename(row);
+      const wanted = typeof body.title === 'string' ? body.title : '';
+      if (completesLegacyFilename(row, wanted)) {
+        setCompleteFilename(row, wanted);
+      } else {
+        row.title = name(body.title, row.title);
+        row.filename = visibleFilename(row);
+      }
       filenameChanged = row.filename !== previousFilename;
     }
     if (has(body, 'title') || has(body, 'folderId')) checkItemName(index, row);
@@ -273,7 +365,7 @@ async function execute(store, index, action, payload) {
   row.updatedAt = now(); await store.save(index);
   // A failed old-version cleanup must not turn a successful content commit
   // into a failed save. Its garbage entry remains for a later explicit purge.
-  if (action === 'updateItem' && (has(body, 'content') || has(body, 'title'))) await store.garbageCollect(index).catch(() => {});
+  if (action === 'repairFilename' || (action === 'updateItem' && (has(body, 'content') || has(body, 'title')))) await store.garbageCollect(index).catch(() => {});
   store.guard();
   return { ok: true, item: publicRow(row), ...(action === 'deleteItem' ? { trashed: true } : action === 'restoreItem' ? { restored: true } : {}) };
 }

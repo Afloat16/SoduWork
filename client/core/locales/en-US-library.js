@@ -3,6 +3,8 @@
 (function (global) {
   'use strict';
   const messages = {
+    '文件名无效或过长，请缩短名称，不要包含路径。': 'The file name is invalid or too long. Shorten it and do not include a path.',
+    '只能修复这台电脑上的资料文件名': 'Only file names in this computer’s local library can be repaired',
     '成果已变化，请重新打开后保存': 'The deliverable has changed. Reopen it before saving.',
     '成果正在收集，请稍后重试': 'Deliverables are being collected. Please try again shortly.',
     '成果读取不完整，请重试': 'The deliverable could not be read completely. Please try again.',
