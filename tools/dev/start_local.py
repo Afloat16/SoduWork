@@ -192,13 +192,7 @@ def password_for_start(state: Path, config: dict, stdin: bool) -> str:
     return password
 
 
-def probe_port(host: str, port: int):
-    """Probe port availability exactly the way serve() will bind it.
-
-    Binds a short-lived probe socket and closes it inside the with block, so no
-    listener is left behind and no file is touched — safe to call from --check.
-    Returns the OSError on failure, or None when the port is free.
-    """
+def assert_available(host: str, port: int) -> None:
     address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
     with socket.socket(address_family) as probe:
         if os.name == "nt":
@@ -209,20 +203,13 @@ def probe_port(host: str, port: int):
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((host, port))
-        except OSError as exc:
-            return exc
-    return None
-
-
-def assert_available(host: str, port: int) -> None:
-    exc = probe_port(host, port)
-    if exc is None:
-        return
-    if exc.errno == errno.EADDRINUSE or getattr(exc, 'winerror', None) == 10048:
-        raise StartupError(f"Port {port} is already in use. Existing services were left running. "
-                           "Choose another port with --port.") from exc
-    raise StartupError(f"Cannot bind to {host}:{port}: {exc}. "
-                       "Check --host and your network configuration.") from exc
+        except (OSError, TypeError, UnicodeError) as exc:
+            # bind() can fail during hostname encoding before Winsock or POSIX returns an errno.
+            if getattr(exc, "errno", None) == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+                raise StartupError(f"Port {port} is already in use. Existing services were left running. "
+                                   "Choose another port with --port.") from exc
+            raise StartupError(f"Cannot bind to {host}:{port}: {exc}. "
+                               "Check --host and your network configuration.") from exc
 
 
 def runtime_environment(state: Path, config: dict, password: str, host: str, port: int) -> dict:
@@ -485,7 +472,7 @@ def main(argv=None) -> int:
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--desktop", action="store_true", help="Also install and open the desktop client with an isolated profile")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check", action="store_true", help="Check prerequisites without installing or changing files")
+    mode.add_argument("--check", action="store_true", help="Check prerequisites and HTTP port availability without installing or changing files")
     mode.add_argument("--prepare-only", action="store_true", help="Install dependencies and build the UI, without starting a service or asking for a password")
     parser.add_argument("--password-stdin", action="store_true", help="Read the first administrator password from stdin, never arguments or a file")
     args = parser.parse_args(argv)
@@ -506,20 +493,9 @@ def main(argv=None) -> int:
             check_windows_source_paths(args.data_dir.expanduser(), source_copy_targets(), probe=False)
             if profile is not None:
                 print(f'Desktop profile: {profile}')
-            # Ports are not part of dependency_report, yet a busy port is the most
-            # common reason a "passing" check still fails at startup. Probe with the
-            # same helper serve() uses, so a passing check really means startable.
-            port_exc = probe_port(args.host, args.port)
-            if port_exc is None:
-                print(f"Port {args.port} is free.")
-            elif port_exc.errno == errno.EADDRINUSE or getattr(port_exc, 'winerror', None) == 10048:
-                print(f"Port {args.port} is already in use; use --port to pick another one. "
-                      "A previous instance may not have shut down cleanly.", file=sys.stderr)
-                return 1
-            else:
-                print(f"Cannot bind to {args.host}:{args.port}: {port_exc}. "
-                      "Check --host and your network configuration.", file=sys.stderr)
-                return 1
+            assert_available(args.host, args.port)
+            print(f"Port {args.port} is free.")
+            print("Prerequisites are ready. First-time setup needs internet access; no files were changed.")
             return 0
         check_dependencies()
         state = args.data_dir.expanduser().resolve()
