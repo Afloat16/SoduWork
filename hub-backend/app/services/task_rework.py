@@ -238,7 +238,7 @@ async def _lock_rework_task(session, task):
     await session.refresh(task, ["status", "archived_at", "work_routing"])
 
 
-async def _return_to_rework(session: AsyncSession, task: models.Task, *, why: str) -> bool:
+async def return_to_rework(session: AsyncSession, task: models.Task, *, why: str) -> bool:
     """Apply the authorized transitions while holding the review task's lock."""
     from . import task_status
     if task.archived_at or task.status == "cancel" or await task_status.engine_owns(session, [task.id]):
@@ -312,7 +312,7 @@ async def resume_after_rejection(
 
     if wait_for_executor or not ref or ref.startswith("conversation:"):
         await _lock_rework_task(session, task)
-        if not await _return_to_rework(session, task, why="验收退回待返修"):
+        if not await return_to_rework(session, task, why="验收退回待返修"):
             return {"mode": "human", "started": False, "error": "需求状态已变化，请刷新后再安排返修"}
     if wait_for_executor:
         # Rejecting delivery requests revision; it does not authorize another
@@ -381,7 +381,7 @@ async def resume_after_rejection(
                     or (pending.get("versionId") and pending["versionId"] != artifact_version_id)):
         await session.commit()
         return receipt
-    applied = await _return_to_rework(session, task, why="人工退回后自动返修")
+    applied = await return_to_rework(session, task, why="人工退回后自动返修")
     if not applied and not pending:
         await session.commit()
         return receipt
