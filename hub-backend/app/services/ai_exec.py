@@ -423,10 +423,11 @@ async def with_task_git(session, ctx: dict, task, *, lock_to_client: bool = True
     out = dict(ctx or {})
     try:
         from ..models import Client
-        from . import code_creds
+        from . import code_creds, task_code_targets
         c = await session.get(Client, cid)
         if c is not None:
-            out = with_git(out, code_creds.resolve(c))
+            repo = await task_code_targets.repo_view(session, task) if getattr(task, "repo_id", None) else None
+            out = with_git(out, code_creds.for_repo(c, getattr(repo, "git_url", "")))
     except Exception as e:  # noqa: BLE001 - Credential lookup failure must not disable the entire dispatch path.
         log.warning("解析任务归属人的代码账号失败: %s", type(e).__name__)
     # Employee tasks remain bound to the owner's current device.

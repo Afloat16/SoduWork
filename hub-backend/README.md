@@ -14,6 +14,10 @@ A completion with a requester produces one stored receipt. Retrying that complet
 
 Creating or editing a task through the tasks API accepts up to 200 characters for the title, 64 for the requester name, 200 for contact details and 36 for the requester ID. An over-limit field returns HTTP 422 with its name. When an existing task exceeds these limits, the receipt and notice show shortened titles and names with an ellipsis. They omit over-limit contacts and IDs to avoid directing a reply to the wrong recipient. The optional `fieldWarnings` object identifies each affected field with `truncated` or `omitted`. The completion response exposes the same warnings under `receiptFieldWarnings` and retains the original task values.
 
+## Personal Git credentials
+
+The personal Git connection test sends an HTTPS token only to a host and port from an HTTPS repository visible to the current account in the Hub. A manually entered repository on that origin is supported. Use the final HTTPS URL for the test. Tasks use their assigned repository and SSH uses its separate key. Update both Hub and Runner to apply the credential-helper change on remote runs.
+
 ## Register client installers
 
 With `client.update`, send one `installer` multipart file to

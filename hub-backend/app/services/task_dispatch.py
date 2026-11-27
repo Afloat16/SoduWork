@@ -399,7 +399,11 @@ async def dispatch(tid, body, client, session, *, actor=None, handoff_claim=None
     extra["workRoot"] = _wd.get("workRoot", "")
     # Fill missing project association so code-delivery checks can resolve the repository.
     try:
+        newly_linked = _repo is not None and not t.repo_id
         _link_task_repo(t, _repo)
+        if newly_linked and not handoff:
+            # The credential lookup before routing could not yet bind this repository.
+            ctx = await ai_exec.with_task_git(session, ctx, t, lock_to_client=False)
         await _attach_dev_flow(session, extra["repo"], _repo)   # Merge global development-flow defaults with repository overrides.
         await _attach_skills(session, extra, extra["repo"], client)   # Resolve selected skills against their availability policy.
         # Use the provider's project association when the task project has an explicit binding.
