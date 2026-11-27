@@ -91,7 +91,7 @@ def _is_cjk_text(text: str) -> bool:
     name decodes to when the bytes happen to be valid gb18030 too.
     """
     for ch in text:
-        if "一" <= ch <= "鿿" or "㐀" <= ch <= "䶿":
+        if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff":
             return True
         if unicodedata.category(ch).startswith("P") and ord(ch) > 0x2000:
             return True

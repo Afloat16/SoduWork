@@ -260,7 +260,7 @@ class LibraryArchiveTests(LibraryHttpTestCase):
                  ("cp437", "señor.txt"), ("gb18030", "报告.txt"),
                  ("gb18030", "（2026）.csv"), ("gb18030", "【1】.txt"),
                  ("gb18030", "——.md"), ("gb18030", "？!.log"),
-                 ("gb18030", "“说明”.doc"))
+                 ("gb18030", "“说明”.doc"), ("gb18030", "﨑.txt"), ("cp437", "año.txt"))
         for encoding, display in cases:
             raw_name = display.encode(encoding)
             name = "x" * len(raw_name)
