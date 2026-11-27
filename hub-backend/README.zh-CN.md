@@ -17,6 +17,10 @@ FastAPI + SQLAlchemy(async) + PostgreSQL（本地开发可回退 SQLite）。
 
 通过 tasks API 新建或编辑任务时，允许标题 200 字符、请求人姓名 64 字符、联系方式 200 字符、请求人 ID 36 字符。字段超限时返回 HTTP 422 并指出字段名。如果已有任务超过这些限制，回执和通知用省略号标明缩短的标题或姓名，超长联系方式和 ID 会省略，以免将回复发给错误的收件人。可选的 `fieldWarnings` 对象会为受影响字段标记 `truncated` 或 `omitted`。办结响应在 `receiptFieldWarnings` 中返回相同提示，并保留任务原值。
 
+## 个人 Git 凭据
+
+「我的 Git」连接测试仅向当前账号在 Hub 中可见的已登记 HTTPS 仓库主机和端口提供令牌。可手填同一站点的其他仓库，测试时请使用最终 HTTPS 地址。任务按绑定仓库使用凭据，SSH 沿用独立的私钥。远程执行时请同步更新 Hub 和 Runner。
+
 ## 登记客户端安装包
 
 拥有 `client.update` 权限的管理员向 `POST /api/v1/admin/client-releases/upload`
