@@ -101,6 +101,13 @@ if (typeof electron === 'string') {
     win.webContents.session.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (_, done) => done({ cancel: true }));
     await win.loadFile(fixture); await until('window.fixtureReady===true'); win.webContents.debugger.attach('1.3'); await viewport(1100);
     assert.deepEqual(await js('window.errors'), []);
+    const repeated = snapshot([user('Summarize'), answer([text('First summary')]), user('Summarize again')], [], {
+      status: 'failed', execution: { running: false, reason: 'Working directory is unavailable' },
+    });
+    await publish(repeated, true);
+    assert.deepEqual(await visibleSummaryText('[data-chat-node="runtime-error"] .nbad-copy'), [repeated.execution.reason]);
+    assert.deepEqual(await visibleSummaryText('[data-chat-node="turn-metrics"] [data-thinking-label]'), ['执行失败']);
+    report.results.push('A failed repeat submission shows its own diagnostic and failure label after an earlier successful answer');
     const complete = doneState(), live = structuredClone(complete);
     live.status = 'streaming'; live.execution.running = true; live.messages[2].done = false;
     live.messages[2].blocks.forEach(block => block.done = false);
@@ -136,16 +143,17 @@ if (typeof electron === 'string') {
       { role: 'assistant', done: true, blocks: [text('Legacy answer')] }], [], { execution: { running: false, elapsedMs: 0 } });
     await publish(unknownTiming, true);
     assert.match(await js('document.querySelector(".nturn-summary").innerText'), /用时\s*未记录/);
-    assert.deepEqual(await visibleSummaryText('[data-turn-label]'), ['展开过程']);
+    assert.doesNotMatch(await js('document.querySelector("[data-turn-toggle]").innerText'), /展开过程|收起过程/);
+    assert.equal(await js('document.querySelector("[data-turn-toggle]").getAttribute("aria-label")'), '展开过程');
     assert.deepEqual(await visibleSummaryText('[data-turn-empty]'), []);
     await click('[data-turn-toggle]');
-    assert.deepEqual(await visibleSummaryText('[data-turn-label]'), ['收起过程']);
+    assert.equal(await js('document.querySelector("[data-turn-toggle]").title'), '收起过程');
     assert.deepEqual(await visibleSummaryText('[data-turn-empty]'), ['本轮没有可显示的过程记录。']);
     assert.deepEqual(await visibleTexts(), ['Legacy answer']);
     await key('[data-turn-toggle]', 'Enter');
-    assert.deepEqual(await visibleSummaryText('[data-turn-label]'), ['展开过程']);
+    assert.equal(await js('document.querySelector("[data-turn-toggle]").getAttribute("aria-label")'), '展开过程');
     assert.deepEqual(await visibleSummaryText('[data-turn-empty]'), []);
-    report.results.push('A final-answer-only turn visibly names its disclosure, explains the empty expanded state, and keeps the answer on screen');
+    report.results.push('The duration disclosure retains its accessible label, explains an empty expanded turn, and keeps the answer on screen');
     await publish(complete, true);
     await js(`window.processNode=document.querySelector('[data-chat-node="message:1"]');window.finalNode=document.querySelector('[data-chat-node="message:2"]')`);
     report.results.push('Completed duration stays 23s when an idle counter advances, across conversation switches and remount; another turn keeps 7s and unknown historical timing is marked as unrecorded');
@@ -237,7 +245,7 @@ if (typeof electron === 'string') {
     assert.doesNotMatch(summaries[1].text, /222|tokens/);
     history.messages[4].blocks.unshift(thought(' \n '));
     await publish(history); await click('[data-turn-toggle="reply:58"]');
-    assert.deepEqual(await visibleSummaryText('[data-turn-label]'), ['展开过程', '收起过程']);
+    assert.deepEqual(await js('Array.from(document.querySelectorAll("[data-turn-toggle]"), button => button.getAttribute("aria-label"))'), ['展开过程', '收起过程']);
     assert.deepEqual(await visibleSummaryText('[data-turn-empty]'), ['本轮没有可显示的过程记录。']);
     assert.equal(await js('Array.from(document.querySelectorAll(".nthink,.ntool")).filter(visible).length'), 0,
       'Blank provider content is not a process record, and the previous turn stays folded');
