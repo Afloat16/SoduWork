@@ -51,6 +51,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, '{"state":"ready","version":"v2"}')
         elif self.path in {"/large", "/large-error"}:
             self.send(500 if self.path == "/large-error" else 200, "ready" + "x" * 20000 + "forbidden")
+        elif self.path in {"/short", "/short-error"}:
+            self.send_response(500 if self.path == "/short-error" else 200)
+            self.send_header("Content-Length", "177")
+            self.end_headers()
+            self.wfile.write(b"ready")
+        elif self.path == "/broken-chunks":
+            self.send_response(500)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"5\r\nready\r\n")
         elif self.path == "/exact-limit":
             self.send(200, "x" * 20000)
         elif self.path == "/error":
@@ -130,6 +140,18 @@ try:
             **extra,
         }, ROOT, dict(os.environ), run_id)
         chk("大响应的状态或已读命中断言继续可用", passed, detail)
+
+    for path, status in (("/short", 200), ("/short-error", 500)):
+        passed, detail = runner_deploy._check({
+            "type": "http", "url": base + path, "expectStatus": status,
+            "notContains": "forbidden",
+        }, ROOT, dict(os.environ), run_id)
+        chk("提前断开的 %d 响应不能证明正文完整" % status, not passed and "完整" in detail, detail)
+
+    passed, detail = runner_deploy._check({
+        "type": "http", "url": base + "/broken-chunks", "expectStatus": 500,
+    }, ROOT, dict(os.environ), run_id)
+    chk("只检查状态码时不依赖正文读取", passed, detail)
 
     class BrokenBody(io.BytesIO):
         def read(self, *_args):
