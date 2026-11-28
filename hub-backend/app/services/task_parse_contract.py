@@ -97,20 +97,20 @@ def _apply_scene(
 
 def _extract_json(s: str) -> dict:
     """Parse the first complete top-level object without promoting nested objects from
-    an incomplete or malformed response.
+    arrays or incomplete or malformed responses.
     """
     import json
     text = (s or "").strip()
     decoder = json.JSONDecoder()
     start = None
-    depth = 0
+    closing = []
     in_string = False
     escaped = False
     for index, char in enumerate(text):
         if start is None:
-            if char == "{":
+            if char in "{[":
                 start = index
-                depth = 1
+                closing.append("}" if char == "{" else "]")
             continue
         if in_string:
             if escaped:
@@ -121,11 +121,12 @@ def _extract_json(s: str) -> dict:
                 in_string = False
         elif char == '"':
             in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
+        elif char in "{[":
+            closing.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if char != closing.pop():
+                return {}
+            if not closing:
                 try:
                     value, _ = decoder.raw_decode(text, start)
                 except (ValueError, RecursionError):
