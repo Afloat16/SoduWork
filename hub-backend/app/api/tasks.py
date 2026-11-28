@@ -795,12 +795,14 @@ def _ms_api(m) -> dict:
             "model": getattr(m, "model", "") or ""}
 
 
-async def _load_milestones(session: AsyncSession, tid: str) -> list:
+async def _load_milestones(session: AsyncSession, tid: str, *, for_update: bool = False) -> list:
     from sqlalchemy import select as _sel
 
     from ..models import Milestone
-    rows = (await session.execute(
-        _sel(Milestone).where(Milestone.task_id == tid).order_by(Milestone.seq))).scalars().all()
+    query = _sel(Milestone).where(Milestone.task_id == tid).order_by(Milestone.seq)
+    if for_update:
+        query = query.with_for_update()
+    rows = (await session.execute(query)).scalars().all()
     return list(rows)
 
 
@@ -1128,7 +1130,10 @@ async def put_milestones(
     """
     from ..models import Milestone
     from ..services import task_events as ev
-    t = await _my_task(session, client, tid)
+    await task_access.reserve_task_write(session, tid, client.id)
+    t = await session.get(Task, tid, with_for_update=True, populate_existing=True)
+    if t is None or not task_access.is_owner(t, client):
+        raise HTTPException(status_code=404, detail="需求不存在")
     # The plan is part of the requirement definition: rewriting it after acceptance left the review
     # record describing a scope that no longer existed. ai-plan already refuses the same task.
     if t.status in ("done", "cancel"):
@@ -1139,7 +1144,7 @@ async def put_milestones(
     if len(items) > 30:
         raise HTTPException(status_code=400, detail="里程碑太多了（最多 30 个），先拆成几条需求吧")
     await _milestone_selections(session, client, t, items)
-    old = {m.id: m for m in await _load_milestones(session, tid)}
+    old = {m.id: m for m in await _load_milestones(session, tid, for_update=True)}
     keep: set[str] = set()
     for i, it in enumerate(items):
         if not isinstance(it, dict):
@@ -1151,28 +1156,30 @@ async def put_milestones(
             continue
         mid = str(it.get("id") or "").strip()
         m = old.get(mid)
+        st = str(it["status"]).strip() if it.get("status") is not None else ""
+        accept = str(it.get("accept") or "").strip()[:2000]
+        if m is not None and m.status == "done":
+            if st and st != "done":
+                raise HTTPException(status_code=400, detail=f"「{m.title}」已经验收通过，不能修改状态")
+            if "accept" not in it:
+                accept = m.accept
+            if title != m.title or accept != m.accept:
+                raise HTTPException(status_code=400, detail=f"「{m.title}」已经验收通过，不能修改标题或验收条件")
+        if st not in ("", "planned", "skipped") and (m is None or st != m.status):
+            raise HTTPException(status_code=400, detail="里程碑执行状态只能由执行或验收操作设置")
         if m is None:
             m = Milestone(task_id=tid)
             session.add(m)
         m.seq = i
         m.title = title
-        m.accept = str(it.get("accept") or "").strip()[:2000]
+        m.accept = accept
         m.repo_id = str(it.get("repoId") or "").strip()
         m.parallel_ok = bool(it.get("parallelOk"))
         # Each stage may override its executor and model.
         m.agent_id = str(it.get("agentId") or "").strip()
         m.agent_type = str(it.get("agentType") or "").strip()
         m.model = str(it.get("model") or "").strip()
-        st = str(it.get("status") or "").strip()
-        # #664: skipped里程碑不可验收
-        # #665: skipped里程碑不可重新规划为doing/done
-        if m.status == "done" and st == "skipped":
-            # 已验收的里程碑不能被降级为skipped
-            raise HTTPException(status_code=400, detail=f"「{m.title}」已经验收通过，不能标记为不做")
-        # Accept only user-editable states: skipped or planned.
-        # Execution determines doing, done, and failed; clients cannot assign those results directly.
-        # Preserve current state for other values instead of defaulting to planned.
-        # Editing a title must not silently unskip a milestone.
+        # Clients may echo an existing execution result when saving the plan.
         if st in ("planned", "skipped"):
             m.status = st
         elif not m.status:          # Assign default state only to newly created milestones.
