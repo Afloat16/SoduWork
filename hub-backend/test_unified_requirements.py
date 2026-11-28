@@ -604,6 +604,34 @@ class UnifiedRequirementTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             self.assertEqual((await session.get(models.Milestone, mid)).status, "doing")
 
+    async def test_closed_tasks_keep_their_milestone_plan(self):
+        for status in ("done", "cancel"):
+            with self.subTest(status=status):
+                tid, mid = await self._seed_guard_milestone(task_status=status, suffix=status)
+                route = f"tasks/{tid}/milestones"
+                response = await self.call("PUT", route, json={"items": []})
+                self.assertEqual(response.status_code, 409, response.text)
+                rows = (await self.call("GET", route)).json()["items"]
+                self.assertEqual([row["id"] for row in rows], [mid])
+
+    async def test_plan_edits_preserve_accepted_rows_and_reject_fabricated_results(self):
+        tid, _ = await self._seed_guard_milestone(status="done", rounds=1)
+        route = f"tasks/{tid}/milestones"
+        row, = (await self.call("GET", route)).json()["items"]
+        additional = {"title": "Next step"}
+        for edit in ([], [{**row, "status": "planned"}], [{**row, "status": "skipped"}],
+                     [{**row, "accept": "different criteria"}], [{**row, "title": "different scope"}],
+                     [row, {"title": "Unrun", "status": "done"}]):
+            with self.subTest(edit=edit):
+                response = await self.call("PUT", route, json={"items": [additional, *edit]})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual((await self.call("GET", route)).json()["items"], [row])
+        response = await self.call("PUT", route, json={"items": [row, additional]})
+        self.assertEqual(response.status_code, 200, response.text)
+        accepted, new = response.json()["items"]
+        self.assertEqual(accepted, row)
+        self.assertEqual(new["status"], "planned")
+
     async def test_milestone_terminal_task_cannot_dispatch_or_resume(self):
         for index, (status, explicit) in enumerate((
                 ("done", True), ("done", False), ("cancel", True), ("cancel", False))):
