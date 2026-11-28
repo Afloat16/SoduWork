@@ -87,3 +87,14 @@ test('audit recognizes cataloged copy passed to tx through destructured variable
   assert.deepEqual(report.missingMessages, [])
   assert.deepEqual(report.unmarked, [])
 })
+
+test('audit distinguishes translated map labels from raw rows retained by callbacks', (t) => {
+  const { status, report } = audit(t, [
+    "[['a', '已连接']].map(([key, label]) => <span key={key}>{tx(label)}</span>)",
+    "[['b', '重试']].filter(([key, label]) => key).map(row => <span>{row[1]}</span>)",
+    "[['c', '连接失败']].map(([key, label], i, rows) => <span title={rows[i][1]}>{tx(label)}</span>)",
+  ].join(';\n'))
+  assert.equal(status, 1)
+  assert.equal(report.uiOccurrences, 1)
+  assert.deepEqual(report.unmarked.map(row => row.source), ['重试', '连接失败'])
+})
