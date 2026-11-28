@@ -229,6 +229,43 @@ test('an explicit programmatic task send remains independent of a pending compos
   assert.ok(f.requests.some(row => row[1] === 'Keep composer draft'));
 });
 
+test('requirement dispatch returns the current send refusal and leaves a later attempt independent', async () => {
+  const reason = '所选模型已停用，请重新选择';
+  const detail = '本次执行配置已变化，请重新打开需求';
+  const publicError = Object.assign(new Error('internal dispatch failure'), {detail});
+  const responses = [{ok: false, reason}, publicError, new Error('private transport details'), {ok: false}, {ok: true}];
+  const {ctx, requests} = fixture({send() {
+    const response = responses.shift();
+    if (response instanceof Error) throw response;
+    return response;
+  }});
+  const task = {id: 'task-a', title: 'Generate a report', status: 'todo'};
+  ctx.global.SoduWorkAPI = {getTask: async () => task};
+  Object.assign(ctx, {_collabTasks: new Map(), _collabStarts: new Set(), _send: ctx._sendCore,
+    sessionInfo: () => ({adapterId: 'pi'}), _workModel: () => '', refreshHistory() {}});
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../components/panels/chat-task-start.js'), 'utf8'), ctx);
+  const {enqueueTask} = ctx.global.ChatTaskStart.create(ctx, {
+    _viewGuard: () => () => true, _openTask: async () => true, _persistTaskBinding: async () => true,
+    _bindCollaborationTask: id => ctx._collabTasks.set(id, {}), _collabEntryStatus: () => '',
+    _setCollabEntryStatus() {},
+  });
+  const dispatch = () => enqueueTask(task.id, {source: 'task-dispatch', agentId: 'local:pi'});
+  ctx._model = {unavailable: true};
+  assert.equal((await dispatch()).reason, '原本地模型已删除或不可用，请主动选择可用模型后继续发送');
+  ctx._model = null;
+  const rejected = await dispatch();
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, reason);
+  assert.equal((await dispatch()).reason, detail);
+  for (let i = 0; i < 2; i++) {
+    const unconfirmed = await dispatch();
+    assert.equal(unconfirmed.ok, false);
+    assert.equal(unconfirmed.reason, '需求未能进入会话队列，请查看会话提示');
+  }
+  assert.equal((await dispatch()).ok, true);
+  assert.equal(requests.length, 5);
+});
+
 for (const hook of ['capture', 'render']) {
   test(`a synchronous ${hook} failure releases its submission reservation and retains the unsent draft`, async () => {
     const f = fixture();
@@ -602,6 +639,12 @@ function requirementRecovery(f, { task, snapshot } = {}) {
 const requirementOptions = () => ({ taskId: 'req-a', taskTitle: 'Requirement A',
   taskExecution: { reuseConversation: true, agentId: 'local:pi', model: 'same-model', repo: { id: 'repo-a' } } });
 
+function pluginRequirementOptions() {
+  const plugin = { pluginId: 'local:method', name: 'Fixture method', inputValues: { region: 'east' } };
+  return { taskId: 'req-a', taskTitle: 'Requirement A', plugins: [plugin],
+    taskExecution: { reuseConversation: true, agentId: 'local:pi', model: 'same-model', assignmentPluginId: plugin.pluginId } };
+}
+
 for (const failure of ['rejected', 'transport']) {
   test(`a ${failure} requirement send retains its identity and never becomes ordinary composer input`, async () => {
     const f = fixture({ send: async () => {
@@ -639,6 +682,47 @@ test('accepted requirement submission metadata retains its scoped identity for l
   assert.match(require('./renderer-source.cjs').readFileSync(
     path.join(__dirname, '../components/panels/panels-chat.js'), 'utf8'),
   /canRestore \|\| submittedDraft\?\.requirement/);
+});
+
+for (const failure of ['rejected', 'transport', 'queued']) {
+  test(`a ${failure} requirement retries with the selected plugin and its confirmed inputs`, async () => {
+    const f = fixture({ send: async () => {
+      if (failure === 'transport') throw Error('IPC receipt lost');
+      if (failure === 'queued') return { ok: true, queued: true, queueId: 'fixture-queue' };
+      return { ok: false, reason: 'not prepared' };
+    } });
+    const request = pluginRequirementOptions();
+    const [plugin] = request.plugins;
+    assert.equal(await f.ctx._sendCore('requirement instruction', request), failure === 'queued');
+    const id = f.requests[0][3].submissionId;
+    if (failure === 'queued') {
+      const draft = f.ctx._submissionDrafts.get(id);
+      draft.requirement.deliveryState = 'failed';
+      f.ctx._retryDraft = draft;
+    }
+    const starts = requirementRecovery(f);
+    assert.equal(await f.ctx._restoreRetryDraft(), true);
+    assert.equal(starts.length, 1);
+    const retry = starts[0].options;
+    assert.equal(retry.taskExecution.assignmentPluginId, plugin.pluginId);
+    assert.equal(retry.assignmentPlugin?.pluginId, plugin.pluginId);
+    assert.equal(retry.assignmentPlugin.inputValues.region, 'east');
+    assert.equal(retry.submissionId, failure === 'transport' ? id : '');
+    assert.equal(retry.retry, failure !== 'transport');
+  });
+}
+
+test('requirement recovery refuses to replay a saved plugin without its original inputs', async () => {
+  const f = fixture({ send: async () => ({ ok: false, reason: 'not prepared' }) });
+  await f.ctx._sendCore('requirement instruction', pluginRequirementOptions());
+  const draft = f.ctx._retryDraft;
+  // Older acknowledged drafts kept only the display metadata.
+  draft.plugins = [{ pluginId: 'local:method', name: 'Fixture method' }];
+  const starts = requirementRecovery(f);
+  assert.equal(await f.ctx._restoreRetryDraft(), false);
+  assert.equal(starts.length, 0);
+  assert.equal(f.ctx._retryDraft, draft);
+  assert.match(f.notices.at(-1), /重新安排执行/);
 });
 
 test('returning to A restores a failed requirement as an action while preserving its unsent ordinary draft', async () => {
@@ -793,7 +877,7 @@ test('an exact failed requirement receipt permits a new attempt after an uncerta
   assert.equal(starts[0].options.retry, true); assert.equal(starts[0].options.submissionId, '');
 });
 
-test('unconfirmed requirement recovery is idempotent with the real native queue and retains the original submission id', async () => {
+test('unconfirmed requirement recovery retains the plugin and submission ID without duplicating the native queue item', async () => {
   const { createTurnQueue } = require('../main/pi-session/turn-queue');
   const queue = createTurnQueue(); let loseReceipt = true;
   const f = fixture({ send: async (ref, text, attachments, options) => {
@@ -801,12 +885,15 @@ test('unconfirmed requirement recovery is idempotent with the real native queue 
     if (loseReceipt) { loseReceipt = false; throw Error('IPC receipt lost after enqueue'); }
     return { ok: true, queueId: item.id };
   } });
-  await f.ctx._sendCore('instruction', requirementOptions());
+  const request = pluginRequirementOptions();
+  const [plugin] = request.plugins;
+  await f.ctx._sendCore('instruction', request);
   const original = f.requests[0][3].submissionId;
   const lookup = deferred(); requirementRecovery(f);
   f.ctx.global.SoduWorkAPI.getTask = () => lookup.promise;
   f.ctx._startTask = (item, opts) => f.ctx._sendCore(opts.instruction, {
     taskId: item.id, taskExecution: opts.taskExecution, retry: opts.retry, submissionId: opts.submissionId,
+    plugins: opts.assignmentPlugin ? [opts.assignmentPlugin] : [],
   });
   // Simulate a snapshot arriving before the send's queue acknowledgement.
   const pending = f.ctx._restoreRetryDraft();
@@ -816,6 +903,8 @@ test('unconfirmed requirement recovery is idempotent with the real native queue 
   assert.equal(f.requests.length, 2); assert.equal(f.requests[1][3].submissionId, original);
   assert.equal(f.requests[1][3].retry, false); assert.equal(queue.size(), 1);
   assert.equal(f.requests[1][3].taskExecution.reuseConversation, true);
+  assert.equal(f.requests[1][3].plugins[0]?.pluginId, plugin.pluginId);
+  assert.equal(f.requests[1][3].plugins[0].inputValues.region, 'east');
 });
 
 for (const unavailable of ['unauthorized', 'snapshot-failed', 'other-conversation']) {

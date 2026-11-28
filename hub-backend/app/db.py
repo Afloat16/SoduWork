@@ -108,6 +108,8 @@ async def init_db() -> None:
 # Compatibility columns used only during adoption of pre-Alembic databases.
 # Existing columns are unchanged; normal versioned upgrades use Alembic.
 _WANT_COLUMNS = {
+    "model_def": [("advertised_ctx_window", "INTEGER")],
+    "ai_usage_event": [("reported_chat_session_id", "VARCHAR(180)")],
     "attachment": [
         # Associate new evidence with its execution and workflow node while retaining legacy compatibility.
         ("role", "VARCHAR(24) DEFAULT 'input'"),
@@ -150,6 +152,7 @@ _WANT_COLUMNS = {
         ("created_by", "VARCHAR(36)"),
         ("created_by_name", "VARCHAR(64) DEFAULT ''"),
         ("assignee_user_id", "VARCHAR(36)"),
+        ("review_recipient_user_id", "VARCHAR(36)"),
         ("recur", "VARCHAR(16)"),
         ("recur_at", "{ts}"),
         ("progress", "{json}"),
@@ -260,6 +263,7 @@ _WANT_COLUMNS = {
         ("competencies", "{json}"),
     ],
     "app_user": [
+        ("is_test_account", "BOOLEAN"),
         ("auth_version", "INTEGER DEFAULT 1"),
         ("positions", "{json}"),
         ("domains", "{json}"),
@@ -293,6 +297,13 @@ _LEGACY_DROP = {
 }
 
 
+for _table in ("project", "repo", "org_unit", "position"):
+    _WANT_COLUMNS.setdefault(_table, []).extend([
+        ("data_source", "VARCHAR(12) NOT NULL DEFAULT 'legacy'"),
+        ("is_archived", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ])
+
+
 def _ensure_columns(conn) -> None:
     from importlib import import_module
     from sqlalchemy import inspect, text
@@ -314,6 +325,7 @@ def _ensure_columns(conn) -> None:
                 continue
             typ = ddl.format(ts=ts, json=json_t, now=now)
             conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {typ}'))
+    conn.execute(text("UPDATE position SET data_source = 'business' WHERE is_system IS TRUE AND data_source = 'legacy'"))
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS ix_client_auth_state ON client (auth_state)"))
     conn.execute(text(
@@ -408,12 +420,15 @@ def _ensure_columns(conn) -> None:
 
 
 def _backfill_data(conn) -> None:
-    """Backfill missing start_at from creation time and completed-task actual_end_at from update
-    time. Preserve existing schedules and keep repeated execution idempotent.
+    """Backfill missing schedules and completion times from recorded task facts.
+    Preserve existing timestamps and keep repeated execution idempotent.
     """
     import hashlib
+    import json
+    from datetime import datetime, timezone
     from importlib import import_module
-    from sqlalchemy import text
+
+    from sqlalchemy import DateTime, bindparam, text
 
     # Legacy adoption is stamped at head; preserve the same usage baseline as
     # the versioned migration before accepting new cumulative reports.
@@ -421,6 +436,7 @@ def _backfill_data(conn) -> None:
     # Legacy adoption skips numbered revisions, so apply the same immutable
     # usage-attribution shape before stamping the database at the integrated head.
     import_module("migrations.versions.0064_usage_attribution").adopt(conn)
+    import_module("migrations.versions.0096_usage_chat_source").backfill(conn)
 
     # create_all does not add indexes to existing tables. Adoption skips the
     # numbered revisions, so preserve and retire duplicates before stamping.
@@ -444,6 +460,35 @@ def _backfill_data(conn) -> None:
             "THEN COALESCE(activated_at,CURRENT_TIMESTAMP) ELSE NULL END "
             "WHERE id=:id"
         ), {"digest": digest, "state": state, "activate": state == "active", "id": row["id"]})
+    # An explicit completion predates later metadata edits. Prefer the latest
+    # recorded done entry before falling back to updated_at for older tasks.
+    completion_update = text(
+        "UPDATE task SET actual_end_at=:completed WHERE id=:id AND actual_end_at IS NULL"
+    ).bindparams(bindparam("completed", type_=DateTime(timezone=True)))
+    for row in conn.execute(text(
+        "SELECT id, progress FROM task WHERE actual_end_at IS NULL AND status = 'done'"
+    )).mappings().all():
+        progress = row["progress"]
+        if isinstance(progress, str):
+            try:
+                progress = json.loads(progress)
+            except ValueError:
+                continue
+        completed = None
+        for entry in progress if isinstance(progress, list) else []:
+            if not isinstance(entry, dict) or entry.get("status") != "done":
+                continue
+            at = entry.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)):
+                continue
+            try:
+                recorded = datetime.fromtimestamp(at / 1000, tz=timezone.utc)
+            except (ValueError, OverflowError, OSError):
+                continue
+            if completed is None or recorded > completed:
+                completed = recorded
+        if completed is not None:
+            conn.execute(completion_update, {"id": row["id"], "completed": completed})
     for sql in (
         "UPDATE task SET start_at = created_at WHERE start_at IS NULL AND created_at IS NOT NULL",
         "UPDATE task SET actual_end_at = updated_at WHERE actual_end_at IS NULL AND status = 'done' AND updated_at IS NOT NULL",

@@ -189,7 +189,8 @@
         ctx._taskStartPrompt = null;
         const accepted = await ctx._send(opts.instruction || item.note || item.description || item.title, {
           taskId: id, taskTitle: item.title || '', retry: opts.retry === true, taskExecution: config,
-          submissionId: opts.submissionId || '', useComposer: opts.fromComposer === true,
+          submissionId: opts.submissionId || '', useComposer: opts.fromComposer === true, onRefusal: opts.onRefusal,
+          ...(opts.assignmentPlugin ? { plugins: [opts.assignmentPlugin] } : {}),
         });
         if (!current()) return Boolean(accepted);
         if (!accepted) _setCollabEntryStatus(entry, 'failed', 'failed');
@@ -239,6 +240,11 @@
           submissionMode: opts.submissionMode || 'default'};
       }
       const ec = config.executionContext, controlled = selection.controlled, kind = selection.adapterId;
+      if (opts.assignmentPlugin && controlled) return {ok:false, reason:'所选插件需要本机会话才能执行'};
+      if (opts.assignmentPlugin !== undefined) {
+        config.assignmentPluginId = opts.assignmentPlugin?.pluginId || '';
+        delete config.assignmentPlugin;
+      }
       const info = ctx.sessionInfo();
       const hasExecutionReceipt = Boolean(task.workRouting?.conversationTurn?.conversationId);
       // Same-owner dispatch reuses verified provenance; unrelated visible chats remain isolated.
@@ -334,9 +340,13 @@
         if (reason) return {ok:false,reason};
       }
       const conversationId = ctx._sessionId;
-      const accepted = await _startTask({ ...task, executionContext: ec }, { taskExecution: config, instruction: opts.brief });
+      let refusal = '';
+      const accepted = await _startTask({ ...task, executionContext: ec }, {
+        taskExecution: config, instruction: opts.brief, assignmentPlugin: opts.assignmentPlugin,
+        onRefusal: reason => { if (typeof reason === 'string') refusal = reason.trim(); },
+      });
       return { ok: accepted, task, conversationId, queued: accepted,
-        ...(accepted ? {} : { reason: ctx._taskOpenError || '需求未能进入会话队列，请查看会话提示' }) };
+        ...(accepted ? {} : { reason: refusal || ctx._taskOpenError || '需求未能进入会话队列，请查看会话提示' }) };
     }
     return { _taskExecutionConfig, _renderTaskStartPrompt, _startTask, _startTaskCommand, enqueueTask };
   }

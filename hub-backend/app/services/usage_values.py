@@ -2,9 +2,32 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import math
 from typing import Any
 
 _QUALITY_RANK = {"unknown": 0, "estimated": 1, "reported": 2, "reconciled": 3}
+MAX_REPORTED_COUNTER = 1_000_000_000
+
+
+def validate_reported_usage(usage: dict | None) -> None:
+    """Reject implausible client-reported counters before they enter the ledger."""
+    data = dict(usage or {})
+    aliases = (
+        "input_tokens", "input", "prompt_tokens", "output_tokens", "output",
+        "completion_tokens", "cache_read_tokens", "cacheRead", "cache_read_input_tokens",
+        "cached_input_tokens", "cache_write_tokens", "cacheWrite",
+        "cache_creation_input_tokens", "cache_write_input_tokens", "reasoning_tokens",
+        "reasoningTokens", "output_reasoning_tokens", "total_tokens", "total",
+    )
+    for name in aliases:
+        if name not in data or isinstance(data[name], bool) or data[name] is None:
+            continue
+        try:
+            value = Decimal(str(data[name]))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if not value.is_finite() or value < 0 or value > MAX_REPORTED_COUNTER:
+            raise ValueError(f"usage.{name} exceeds the supported per-event limit")
 
 
 def _number(value: Any) -> int:
@@ -22,7 +45,8 @@ def _number(value: Any) -> int:
 def _pick(data: dict, *names: str) -> int:
     for name in names:
         value = data.get(name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and not (isinstance(value, float) and not math.isfinite(value)) and value >= 0):
             return _number(value)
     return 0
 
@@ -67,12 +91,15 @@ def _safe_raw(data: dict) -> dict:
     """Keep diagnostics, never arbitrary strings that may contain credentials."""
     out: dict = {}
     for key, value in data.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
         if isinstance(value, (int, float, bool)) or value is None:
             out[str(key)[:80]] = value
         elif key == "cost" and isinstance(value, dict):
             out["cost"] = {
                 str(k)[:40]: v for k, v in value.items()
                 if isinstance(v, (int, float))
+                and not (isinstance(v, float) and not math.isfinite(v))
             }
         elif key == 'costUsd' and isinstance(value, str) and len(value) <= 50:
             try:
